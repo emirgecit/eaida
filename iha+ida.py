@@ -1,3 +1,8 @@
+//sim_vehicle.py -v Rover -f gazebo-rover --console -w --out 127.0.0.1:14551
+//gazebo --verbose ~/ros2_ws/src/iq_sim/worlds/boat.world
+//ros2 launch mavros apm.launch fcu_url:=udp://:14550@
+//python3 ~/python/eaiha.py
+//python3 ~/python/otonom_tekno.py
 import sys
 import math
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QGroupBox

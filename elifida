@@ -1,0 +1,443 @@
+import sys
+import os
+import math
+from collections import deque
+import serial.tools.list_ports
+
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QTimer
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
+    QPushButton, QTabWidget, QTextEdit, QFileDialog, QFormLayout, 
+    QComboBox, QDialog, QGroupBox, QLineEdit, QGridLayout
+)
+from PyQt5.QtWebEngineWidgets import QWebEngineView
+from PyQt5.QtWebChannel import QWebChannel
+from PyQt5.QtGui import QPainter, QColor, QPen, QFont
+import pyqtgraph as pg
+from pymavlink import mavutil
+
+os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
+
+# --- 1. HTML HARİTA (QWebChannel İle) ---
+MAP_HTML = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <style> html, body, #map { height: 100%; margin: 0; padding: 0; } </style>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.3/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.3/dist/leaflet.js"></script>
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body>
+<div id="map"></div>
+<script>
+    let map = L.map('map').setView([40.99, 39.77], 15); // Varsayılan Trabzon/KTÜ
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+    let bridge = null;
+    let idaMarker = null, ihaMarker = null;
+    let idaPath = [], ihaPath = [];
+    let idaPolyline = L.polyline([], { color: 'blue' }).addTo(map);
+    let ihaPolyline = L.polyline([], { color: 'red' }).addTo(map);
+    let selectedVehicle = "İDA";
+
+    new QWebChannel(qt.webChannelTransport, function(channel) {
+        bridge = channel.objects.bridge;
+    });
+
+    map.on('click', function(e) {
+        let lat = e.latlng.lat;
+        let lon = e.latlng.lng;
+        L.circleMarker([lat, lon], {color: selectedVehicle === "İDA" ? 'blue' : 'red', radius: 5}).addTo(map);
+        if (bridge) bridge.mapClicked(lat, lon, selectedVehicle);
+    });
+
+    function setVehicle(vehicle) { selectedVehicle = vehicle; }
+
+    function updateVehicle(lat, lon, vehicle) {
+        let newLatLng = new L.LatLng(lat, lon);
+        if (vehicle === "İDA") {
+            if (!idaMarker) {
+                idaMarker = L.marker(newLatLng).addTo(map).bindPopup("İDA");
+            } else {
+                idaMarker.setLatLng(newLatLng);
+            }
+            idaPath.push(newLatLng);
+            idaPolyline.setLatLngs(idaPath);
+        } else {
+            if (!ihaMarker) {
+                ihaMarker = L.marker(newLatLng).addTo(map).bindPopup("İHA");
+            } else {
+                ihaMarker.setLatLng(newLatLng);
+            }
+            ihaPath.push(newLatLng);
+            ihaPolyline.setLatLngs(ihaPath);
+        }
+        map.setView(newLatLng);
+    }
+</script>
+</body>
+</html>
+'''
+
+# --- 2. PYTHON-JS KÖPRÜSÜ ---
+class MapBridge(QObject):
+    waypoint_signal = pyqtSignal(float, float, str)
+    
+    @pyqtSlot(float, float, str)
+    def mapClicked(self, lat, lon, vehicle):
+        self.waypoint_signal.emit(lat, lon, vehicle)
+
+# --- 3. DİNAMİK YAPAY UFUK (PFD) ---
+class HorizonIndicator(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.setMinimumSize(250, 250)
+        self.setStyleSheet("background-color: #333; border-radius: 10px;")
+
+    def update_attitude(self, roll, pitch):
+        self.roll = roll
+        self.pitch = pitch
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        
+        painter.save()
+        # Merkeze git ve roll açısı kadar döndür
+        painter.translate(w / 2, h / 2)
+        painter.rotate(-self.roll)
+        # Pitch açısı kadar aşağı/yukarı kaydır
+        pitch_scale = 3.0
+        painter.translate(0, self.pitch * pitch_scale)
+
+        # Gökyüzü ve Yer çizimi (Pencereden taşacak kadar büyük çizilir)
+        painter.fillRect(int(-w), int(-h*2), int(w*2), int(h*2), QColor(80, 160, 240)) # Gökyüzü
+        painter.fillRect(int(-w), 0, int(w*2), int(h*2), QColor(100, 180, 80)) # Yer
+        
+        # Ufuk Çizgisi
+        painter.setPen(QPen(Qt.white, 2))
+        painter.drawLine(int(-w), 0, int(w), 0)
+        
+        # Pitch Dereceleri
+        for p in range(-60, 61, 15):
+            if p == 0: continue
+            y = int(-p * pitch_scale)
+            line_w = 20 if p % 30 == 0 else 10
+            painter.drawLine(-line_w, y, line_w, y)
+            painter.drawText(line_w + 5, y + 5, str(abs(p)))
+
+        painter.restore()
+
+        # Sabit Uçak/Araç Simgesi (Ekranın Tam Ortasında)
+        painter.setPen(QPen(Qt.red, 3))
+        painter.drawLine(int(w/2 - 40), int(h/2), int(w/2 - 10), int(h/2))
+        painter.drawLine(int(w/2 + 10), int(h/2), int(w/2 + 40), int(h/2))
+        painter.drawLine(int(w/2), int(h/2 - 10), int(w/2), int(h/2 + 10))
+
+        # Roll ve Pitch Metinleri
+        painter.setPen(Qt.white)
+        painter.drawText(10, 20, f"Roll: {self.roll:.1f}°")
+        painter.drawText(10, 40, f"Pitch: {self.pitch:.1f}°")
+
+# --- 4. ARKA PLAN MAVLINK İŞÇİLERİ (QThread) ---
+class VehicleThread(QThread):
+    # Enlem, Boylam, Hız, İrtifa, Roll, Pitch, Yaw, Mod, Arm, YönSP, HızSP, Renk
+    data_signal = pyqtSignal(float, float, float, float, float, float, float, str, str, float, float, str)
+    log_signal = pyqtSignal(str)
+
+    def __init__(self, vehicle_type):
+        super().__init__()
+        self.vehicle_type = vehicle_type
+        self.master = None
+        self.is_running = False
+
+    def connect_vehicle(self, connection_string, baudrate):
+        try:
+            self.master = mavutil.mavlink_connection(connection_string, baud=baudrate)
+            self.master.wait_heartbeat(timeout=3)
+            self.is_running = True
+            self.log_signal.emit(f"[{self.vehicle_type}] Bağlantı başarılı: {connection_string}")
+            self.start()
+        except Exception as e:
+            self.log_signal.emit(f"[{self.vehicle_type}] Bağlantı Hatası: {e}")
+
+    def run(self):
+        lat, lon, speed, alt, roll, pitch, yaw = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        yon_sp, hiz_sp = 0.0, 0.0
+        mode, arm_status, target_color = "BİLİNMİYOR", "DISARM", "YOK"
+
+        while self.is_running:
+            msg = self.master.recv_match(type=['GLOBAL_POSITION_INT', 'VFR_HUD', 'ATTITUDE', 'HEARTBEAT', 'NAV_CONTROLLER_OUTPUT', 'STATUSTEXT'], blocking=True)
+            if not msg: continue
+
+            mtype = msg.get_type()
+            
+            if mtype == 'GLOBAL_POSITION_INT':
+                lat, lon = msg.lat / 1e7, msg.lon / 1e7
+                alt = msg.relative_alt / 1000.0
+            elif mtype == 'VFR_HUD':
+                speed = msg.groundspeed
+            elif mtype == 'ATTITUDE':
+                roll, pitch, yaw = math.degrees(msg.roll), math.degrees(msg.pitch), math.degrees(msg.yaw)
+                if yaw < 0: yaw += 360
+            elif mtype == 'NAV_CONTROLLER_OUTPUT':
+                yon_sp, hiz_sp = msg.target_bearing, msg.wp_dist
+            elif mtype == 'HEARTBEAT':
+                mode = mavutil.mode_string_v10(msg)
+                arm_status = "ARM" if msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED else "DISARM"
+            elif mtype == 'STATUSTEXT' and self.vehicle_type == "İHA":
+                if "COLOR:" in msg.text:
+                    target_color = msg.text.split(":")[1]
+
+            self.data_signal.emit(lat, lon, speed, alt, roll, pitch, yaw, mode, arm_status, yon_sp, hiz_sp, target_color)
+
+    def send_command(self, cmd_id, param1=0, param2=0, param3=0, param4=0, param5=0, param6=0, param7=0):
+        if self.master:
+            self.master.mav.command_long_send(self.master.target_system, self.master.target_component, cmd_id, 0, param1, param2, param3, param4, param5, param6, param7)
+            self.log_signal.emit(f"[{self.vehicle_type}] Komut gönderildi: {cmd_id}")
+
+    def send_waypoint(self, lat, lon):
+        if self.master:
+            try:
+                mod_id = self.master.mode_mapping()['GUIDED']
+                self.master.mav.set_mode_send(self.master.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mod_id)
+                self.master.mav.set_position_target_global_int_send(
+                    0, self.master.target_system, self.master.target_component,
+                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                    int(0b110111111000), int(lat * 1e7), int(lon * 1e7), 0, 0, 0, 0, 0, 0, 0, 0)
+                self.log_signal.emit(f"[{self.vehicle_type}] Hedef gönderildi: {lat}, {lon}")
+            except Exception as e:
+                self.log_signal.emit(f"[{self.vehicle_type}] Waypoint Hatası: {e}")
+
+    def disconnect(self):
+        self.is_running = False
+        if self.master:
+            self.master.close()
+            self.log_signal.emit(f"[{self.vehicle_type}] Bağlantı kesildi.")
+
+# --- 5. ANA YER İSTASYONU ---
+class YerKontrolIstasyonu(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("KTÜ UZAY YGM - Çift Araçlı Yer Kontrol İstasyonu")
+        self.setGeometry(100, 100, 1300, 800)
+
+        # Veri grafikleri için listeler
+        self.ida_speed_list = deque(maxlen=100)
+        self.iha_alt_list = deque(maxlen=100)
+
+        # Araç Thread'leri
+        self.ida_thread = VehicleThread("İDA")
+        self.iha_thread = VehicleThread("İHA")
+        
+        self.ida_thread.log_signal.connect(self.log_yazdir)
+        self.iha_thread.log_signal.connect(self.log_yazdir)
+
+        self.initUI()
+        
+        # Grafik güncelleme döngüsü
+        self.graph_timer = QTimer()
+        self.graph_timer.timeout.connect(self.update_graphs)
+        self.graph_timer.start(500)
+
+    def initUI(self):
+        self.tabs = QTabWidget()
+        self.mainTab = QWidget()
+        self.graphTab = QWidget()
+        self.connTab = QWidget()
+
+        self.tabs.addTab(self.connTab, "Bağlantı Ayarları")
+        self.tabs.addTab(self.mainTab, "Operasyon Merkezi")
+        self.tabs.addTab(self.graphTab, "Grafikler & Log")
+
+        self.build_conn_tab()
+        self.build_main_tab()
+        self.build_graph_tab()
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.tabs)
+        self.setLayout(layout)
+
+    def build_conn_tab(self):
+        layout = QVBoxLayout()
+        
+        # İDA Bağlantı Paneli (868 MHz / UDP)
+        ida_group = QGroupBox("İDA (Su Üstü Aracı) Bağlantısı - 868 MHz")
+        ida_layout = QFormLayout()
+        self.ida_port = QLineEdit("udpin:0.0.0.0:14551")
+        self.ida_baud = QComboBox()
+        self.ida_baud.addItems(["57600", "115200"])
+        self.ida_conn_btn = QPushButton("İDA'ya Bağlan")
+        self.ida_conn_btn.clicked.connect(lambda: self.ida_thread.connect_vehicle(self.ida_port.text(), int(self.ida_baud.currentText())))
+        ida_layout.addRow("Port/Bağlantı:", self.ida_port)
+        ida_layout.addRow("Baud Rate:", self.ida_baud)
+        ida_layout.addRow(self.ida_conn_btn)
+        ida_group.setLayout(ida_layout)
+
+        # İHA Bağlantı Paneli (433 MHz / UDP)
+        iha_group = QGroupBox("İHA (İnsansız Hava Aracı) Bağlantısı - 433 MHz")
+        iha_layout = QFormLayout()
+        self.iha_port = QLineEdit("udpin:0.0.0.0:14552")
+        self.iha_baud = QComboBox()
+        self.iha_baud.addItems(["57600", "115200"])
+        self.iha_conn_btn = QPushButton("İHA'ya Bağlan")
+        self.iha_conn_btn.clicked.connect(lambda: self.iha_thread.connect_vehicle(self.iha_port.text(), int(self.iha_baud.currentText())))
+        iha_layout.addRow("Port/Bağlantı:", self.iha_port)
+        iha_layout.addRow("Baud Rate:", self.iha_baud)
+        iha_layout.addRow(self.iha_conn_btn)
+        iha_group.setLayout(iha_layout)
+
+        layout.addWidget(ida_group)
+        layout.addWidget(iha_group)
+        layout.addStretch()
+        self.connTab.setLayout(layout)
+
+    def build_main_tab(self):
+        layout = QHBoxLayout()
+        
+        # SOL PANEL: Telemetri ve Kontroller
+        left_panel = QVBoxLayout()
+        
+        # İDA Telemetri
+        self.lbl_ida = QLabel("İDA Bekleniyor...")
+        self.lbl_ida.setStyleSheet("background: #e3f2fd; padding: 10px; border-radius: 5px;")
+        
+        # İHA Telemetri
+        self.lbl_iha = QLabel("İHA Bekleniyor...")
+        self.lbl_iha.setStyleSheet("background: #ffebee; padding: 10px; border-radius: 5px;")
+        
+        # Kontroller
+        kontrol_g = QGroupBox("Telekomut & Kontrol")
+        kontrol_l = QGridLayout()
+        
+        self.harita_arac_secim = QComboBox()
+        self.harita_arac_secim.addItems(["İDA", "İHA"])
+        self.harita_arac_secim.currentTextChanged.connect(lambda txt: self.mapWidget.page().runJavaScript(f"setVehicle('{txt}')"))
+
+        btn_ida_arm = QPushButton("İDA ARM")
+        btn_ida_arm.clicked.connect(lambda: self.ida_thread.send_command(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1, 21196))
+        
+        btn_ida_disarm = QPushButton("İDA DISARM")
+        btn_ida_disarm.clicked.connect(lambda: self.ida_thread.send_command(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 21196))
+
+        btn_iha_rc = QPushButton("İHA Manuel Gaz (Kanal 3 = 1800)")
+        btn_iha_rc.pressed.connect(lambda: self.iha_thread.master.mav.rc_channels_override_send(self.iha_thread.master.target_system, self.iha_thread.master.target_component, 1500, 1500, 1800, 1500, 0, 0, 0, 0) if self.iha_thread.master else None)
+        btn_iha_rc.released.connect(lambda: self.iha_thread.master.mav.rc_channels_override_send(self.iha_thread.master.target_system, self.iha_thread.master.target_component, 1500, 1500, 1500, 1500, 0, 0, 0, 0) if self.iha_thread.master else None)
+
+        kontrol_l.addWidget(QLabel("Haritada Tıklanan Rota:"), 0, 0)
+        kontrol_l.addWidget(self.harita_arac_secim, 0, 1)
+        kontrol_l.addWidget(btn_ida_arm, 1, 0)
+        kontrol_l.addWidget(btn_ida_disarm, 1, 1)
+        kontrol_l.addWidget(btn_iha_rc, 2, 0, 1, 2)
+        kontrol_g.setLayout(kontrol_l)
+
+        # PFD
+        self.pfd = HorizonIndicator()
+
+        left_panel.addWidget(self.lbl_ida)
+        left_panel.addWidget(self.lbl_iha)
+        left_panel.addWidget(kontrol_g)
+        left_panel.addWidget(self.pfd)
+        
+        # SAĞ PANEL: Harita
+        self.mapWidget = QWebEngineView()
+        self.mapWidget.setHtml(MAP_HTML)
+        
+        self.bridge = MapBridge()
+        self.mapChannel = QWebChannel()
+        self.mapChannel.registerObject("bridge", self.bridge)
+        self.mapWidget.page().setWebChannel(self.mapChannel)
+        self.bridge.waypoint_signal.connect(self.haritadan_waypoint_al)
+
+        layout.addLayout(left_panel, 1)
+        layout.addWidget(self.mapWidget, 3)
+        self.mainTab.setLayout(layout)
+
+        # Thread sinyallerini arayüze bağlama
+        self.ida_thread.data_signal.connect(self.ida_guncelle)
+        self.iha_thread.data_signal.connect(self.iha_guncelle)
+
+    def build_graph_tab(self):
+        layout = QVBoxLayout()
+        
+        # Grafikler
+        graph_layout = QHBoxLayout()
+        self.graph_speed = pg.PlotWidget(title="İDA Hız (m/s)")
+        self.plot_speed = self.graph_speed.plot(pen="b")
+        
+        self.graph_alt = pg.PlotWidget(title="İHA İrtifa (m)")
+        self.plot_alt = self.graph_alt.plot(pen="r")
+        
+        graph_layout.addWidget(self.graph_speed)
+        graph_layout.addWidget(self.graph_alt)
+
+        # Log
+        self.logText = QTextEdit()
+        self.logText.setReadOnly(True)
+
+        layout.addLayout(graph_layout, 1)
+        layout.addWidget(QLabel("Sistem Logları:"), 0)
+        layout.addWidget(self.logText, 1)
+        self.graphTab.setLayout(layout)
+
+    @pyqtSlot(float, float, str)
+    def haritadan_waypoint_al(self, lat, lon, vehicle):
+        if vehicle == "İDA":
+            self.ida_thread.send_waypoint(lat, lon)
+        else:
+            self.iha_thread.send_waypoint(lat, lon)
+
+    def ida_guncelle(self, lat, lon, speed, alt, roll, pitch, yaw, mode, arm, yon_sp, hiz_sp, renk):
+        text = f"<b>[İDA] Mod:</b> {mode} | <b>Durum:</b> {arm}<br>"
+        text += f"Hız: {speed:.1f} m/s | Set Hız: {hiz_sp:.1f}<br>"
+        text += f"Yön: {yaw:.1f}° | Set Yön: {yon_sp:.1f}°<br>"
+        text += f"Koordinat: {lat:.5f}, {lon:.5f}"
+        self.lbl_ida.setText(text)
+        
+        self.ida_speed_list.append(speed)
+        
+        # PFD sadece İDA için çalışsın (veya ComboBox ile seçtirilebilir)
+        if self.harita_arac_secim.currentText() == "İDA":
+            self.pfd.update_attitude(roll, pitch)
+            
+        self.mapWidget.page().runJavaScript(f"updateVehicle({lat}, {lon}, 'İDA')")
+
+    def iha_guncelle(self, lat, lon, speed, alt, roll, pitch, yaw, mode, arm, yon_sp, hiz_sp, renk):
+        text = f"<b>[İHA] Mod:</b> {mode} | <b>Durum:</b> {arm}<br>"
+        text += f"İrtifa: {alt:.1f} m | Hız: {speed:.1f} m/s<br>"
+        text += f"Yön: {yaw:.1f}°<br>"
+        text += f"<b>Hedef Renk Tespit:</b> <span style='color:red;'>{renk}</span><br>"
+        self.lbl_iha.setText(text)
+        
+        self.iha_alt_list.append(alt)
+
+        if self.harita_arac_secim.currentText() == "İHA":
+            self.pfd.update_attitude(roll, pitch)
+
+        self.mapWidget.page().runJavaScript(f"updateVehicle({lat}, {lon}, 'İHA')")
+
+    def update_graphs(self):
+        if self.ida_speed_list:
+            self.plot_speed.setData(list(range(len(self.ida_speed_list))), list(self.ida_speed_list))
+        if self.iha_alt_list:
+            self.plot_alt.setData(list(range(len(self.iha_alt_list))), list(self.iha_alt_list))
+
+    def log_yazdir(self, msg):
+        self.logText.append(msg)
+
+    def closeEvent(self, event):
+        self.ida_thread.disconnect()
+        self.iha_thread.disconnect()
+        event.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = YerKontrolIstasyonu()
+    window.show()
+    sys.exit(app.exec_())

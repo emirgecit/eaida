@@ -1,3 +1,4 @@
+İncelemeye değer bir şey bulunmamakta geliştirme aşamasında olan bir kod sadece. Hiç bakmasan daha iyi.
 # EAIDA
 
 Bu repo, IDA/IHA tarafinda yer istasyonu, telemetri ve otonom denemeler icin gelistirilen kodlari icerir.

@@ -14,7 +14,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel, QPushButton,
-    QFormLayout, QComboBox, QGroupBox, QSplitter, QMessageBox
+    QFormLayout, QComboBox, QGroupBox, QSplitter, QMessageBox, QFileDialog
 )
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 
@@ -201,7 +201,7 @@ class TelemetryThread(QThread):
                 self.link_signal.emit((time.time() - self.last_heartbeat) <= 3.0)
 
                 now = time.time()
-                if now - last_emit >= 0.1:  # 10 Hz
+                if now - last_emit >= 0.1:
                     self.data_signal.emit(lat, lon, speed, roll, pitch, yaw, mode, arm)
                     last_emit = now
 
@@ -260,7 +260,7 @@ class TelemetryThread(QThread):
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("İDA Offline GCS (Race Ready v2)")
+        self.setWindowTitle("İDA Offline GCS (Race Ready v3)")
         self.resize(1600, 900)
 
         self.mb = MBTilesManager("turkey_offline.mbtiles")
@@ -279,16 +279,40 @@ class MainWindow(QWidget):
         self.last_map_js = 0.0
         self.last_vbat = 0.0
 
-        log_name = f"race_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        self.log_fp = open(log_name, "w", newline="", encoding="utf-8")
-        self.log_csv = csv.writer(self.log_fp)
-        self.log_csv.writerow(["ts", "lat", "lon", "speed", "yaw", "mode", "arm", "vbat"])
+        self.log_dir = Path.cwd() / "logs"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_fp = None
+        self.log_csv = None
+        self.open_new_log_file()
 
         self.build_ui()
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_graphs)
         self.timer.start(500)
+
+    def open_new_log_file(self):
+        if self.log_fp:
+            try:
+                self.log_fp.flush()
+                self.log_fp.close()
+            except:
+                pass
+
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        log_name = self.log_dir / f"race_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.log_fp = open(log_name, "w", newline="", encoding="utf-8")
+        self.log_csv = csv.writer(self.log_fp)
+        self.log_csv.writerow(["ts", "lat", "lon", "speed", "yaw", "mode", "arm", "vbat"])
+        self.current_log_path = str(log_name)
+
+    def select_log_folder(self):
+        selected = QFileDialog.getExistingDirectory(self, "Log Klasörü Seç", str(self.log_dir))
+        if selected:
+            self.log_dir = Path(selected)
+            self.open_new_log_file()
+            self.lbl_log_path.setText(f"Log klasörü: {self.log_dir}")
+            self.on_log(f"Yeni log klasörü: {self.log_dir}")
 
     def build_ui(self):
         root = QVBoxLayout(self)
@@ -372,6 +396,14 @@ class MainWindow(QWidget):
         self.curve_bat = self.g_bat.plot(pen=pg.mkPen('#ff9800', width=2))
         r.addWidget(self.g_bat)
 
+        btn_log_folder = QPushButton("📂 Log Klasörü Seç")
+        btn_log_folder.clicked.connect(self.select_log_folder)
+        r.addWidget(btn_log_folder)
+
+        self.lbl_log_path = QLabel(f"Log klasörü: {self.log_dir}")
+        self.lbl_log_path.setStyleSheet("color:#b0b0b0;")
+        r.addWidget(self.lbl_log_path)
+
         self.lbl_log = QLabel("Log: hazır")
         r.addWidget(self.lbl_log)
 
@@ -399,10 +431,11 @@ class MainWindow(QWidget):
         self.lbl_speed.setText(f"Hız: {speed:.2f} m/s")
         self.speed_hist.append(speed)
 
-        self.log_csv.writerow([time.time(), lat, lon, speed, yaw, mode, arm, self.last_vbat])
+        if self.log_csv:
+            self.log_csv.writerow([time.time(), lat, lon, speed, yaw, mode, arm, self.last_vbat])
 
         now = time.time()
-        if self.mb.has_map and (now - self.last_map_js >= 0.2):  # 5 Hz
+        if self.mb.has_map and (now - self.last_map_js >= 0.2):
             self.map_view.page().runJavaScript(
                 f"window.updateBoat({lat},{lon},{speed},'{mode}');"
             )
@@ -430,8 +463,9 @@ class MainWindow(QWidget):
         self.telemetry.stop()
         self.mb.close()
         try:
-            self.log_fp.flush()
-            self.log_fp.close()
+            if self.log_fp:
+                self.log_fp.flush()
+                self.log_fp.close()
         except:
             pass
         e.accept()

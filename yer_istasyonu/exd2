@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+import sys
+import os
+import math
+import time
+import sqlite3
+import threading
+from collections import deque
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QFormLayout, QComboBox, QGroupBox, QSplitter
+)
+from PyQt5.QtWebEngineWidgets import QWebEngineView
+from PyQt5.QtWebChannel import QWebChannel
+
+import pyqtgraph as pg
+import serial.tools.list_ports
+from pymavlink import mavutil
+
+os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu"
+
+MAP_HTML_OFFLINE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    html, body, #map { height:100%; width:100%; margin:0; padding:0; }
+    .badge { position:fixed; left:10px; bottom:10px; background:#2e7d32; color:#fff; padding:6px 10px; border-radius:4px; font-size:11px; z-index:9999; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div class="badge">OFFLINE MAP (MBTiles)</div>
+<script>
+  const map = L.map('map').setView([39.0, 35.0], 7);
+  L.tileLayer('/tile/{z}/{x}/{y}', { maxZoom:18, minZoom:5, tms:true }).addTo(map);
+
+  let marker = null;
+  let path = [];
+  let poly = L.polyline([], { color:'#00e5ff', weight:2 }).addTo(map);
+
+  window.updateBoat = function(lat, lon, speed, mode){
+    if(!marker){
+      marker = L.circleMarker([lat, lon], {
+        radius:8, fillColor:'#4caf50', color:'#fff', weight:2, fillOpacity:0.9
+      }).addTo(map);
+    }
+    marker.setLatLng([lat, lon]);
+    path.push([lat, lon]);
+    if(path.length > 500) path.shift();
+    poly.setLatLngs(path);
+    map.setView([lat, lon], map.getZoom());
+  }
+</script>
+</body>
+</html>
+"""
+
+class MBTilesManager:
+    def __init__(self, mbtiles_path="turkey_offline.mbtiles"):
+        self.path = Path(mbtiles_path)
+        self.conn = None
+        self.has_map = False
+        if self.path.exists():
+            try:
+                self.conn = sqlite3.connect(str(self.path))
+                self.has_map = True
+            except Exception:
+                self.has_map = False
+
+    def get_tile(self, z, x, y):
+        if not self.conn:
+            return None
+        try:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
+                (z, x, y)
+            )
+            row = cur.fetchone()
+            cur.close()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+class OfflineTileHandler(BaseHTTPRequestHandler):
+    mb = None
+    def do_GET(self):
+        if self.path.startswith("/tile/"):
+            try:
+                parts = self.path.split("/")
+                z, x, y = int(parts[2]), int(parts[3]), int(parts[4])
+                data = self.mb.get_tile(z, x, y)
+                if data:
+                    self.send_response(200)
+                    self.send_header("Content-type", "image/png")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            except Exception:
+                self.send_response(500)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def log_message(self, *args):
+        return
+
+class OfflineTileServer(threading.Thread):
+    def __init__(self, mb, port=8765):
+        super().__init__(daemon=True)
+        OfflineTileHandler.mb = mb
+        self.port = port
+    def run(self):
+        srv = HTTPServer(("127.0.0.1", self.port), OfflineTileHandler)
+        srv.serve_forever()
+
+class TelemetryThread(QThread):
+    data_signal = pyqtSignal(float, float, float, float, float, float, str, str)
+    health_signal = pyqtSignal(float, int)
+    log_signal = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.master = None
+        self.running = False
+
+    def connect_vehicle(self, conn_str, baud=57600):
+        try:
+            if conn_str.startswith("udp:") or conn_str.startswith("tcp:"):
+                self.master = mavutil.mavlink_connection(conn_str)
+            else:
+                self.master = mavutil.mavlink_connection(conn_str, baud=baud, timeout=1.0)
+            self.master.wait_heartbeat(timeout=5)
+            self.running = True
+            self.log_signal.emit(f"Bağlandı: {conn_str}")
+            self.start()
+        except Exception as e:
+            self.log_signal.emit(f"Bağlantı hatası: {e}")
+
+    def run(self):
+        lat=lon=speed=roll=pitch=yaw=0.0
+        mode="---"
+        arm="DISARM"
+        vbat=0.0
+        bat=0
+        while self.running and self.master:
+            try:
+                m = self.master.recv_match(
+                    type=["GLOBAL_POSITION_INT","VFR_HUD","ATTITUDE","HEARTBEAT","SYS_STATUS"],
+                    blocking=False
+                )
+                if not m:
+                    time.sleep(0.01)
+                    continue
+                t = m.get_type()
+                if t == "GLOBAL_POSITION_INT":
+                    lat, lon = m.lat/1e7, m.lon/1e7
+                elif t == "VFR_HUD":
+                    speed = m.groundspeed
+                elif t == "ATTITUDE":
+                    roll, pitch, yaw = math.degrees(m.roll), math.degrees(m.pitch), math.degrees(m.yaw)
+                    if yaw < 0: yaw += 360
+                elif t == "HEARTBEAT":
+                    mode = mavutil.mode_string_v10(m)
+                    arm = "ARM" if (m.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) else "DISARM"
+                elif t == "SYS_STATUS":
+                    vbat = m.voltage_battery / 1000.0
+                    bat = m.battery_remaining
+                    self.health_signal.emit(vbat, bat)
+
+                self.data_signal.emit(lat, lon, speed, roll, pitch, yaw, mode, arm)
+            except Exception:
+                pass
+
+    def arm(self):
+        if self.master:
+            self.master.mav.command_long_send(
+                self.master.target_system, self.master.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+                1,0,0,0,0,0,0
+            )
+
+    def disarm(self):
+        if self.master:
+            self.master.mav.command_long_send(
+                self.master.target_system, self.master.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+                0,0,0,0,0,0,0
+            )
+
+    def stop(self):
+        self.running = False
+        if self.master:
+            try: self.master.close()
+            except: pass
+
+class MainWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("İDA Offline GCS (Minimal)")
+        self.resize(1600, 900)
+
+        self.mb = MBTilesManager("turkey_offline.mbtiles")
+        if self.mb.has_map:
+            self.tile_server = OfflineTileServer(self.mb, 8765)
+            self.tile_server.start()
+
+        self.telemetry = TelemetryThread()
+        self.telemetry.data_signal.connect(self.on_data)
+        self.telemetry.health_signal.connect(self.on_health)
+        self.telemetry.log_signal.connect(self.on_log)
+
+        self.speed_hist = deque(maxlen=150)
+        self.bat_hist = deque(maxlen=150)
+
+        self.build_ui()
+
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_graphs)
+        self.timer.start(500)
+
+    def build_ui(self):
+        root = QHBoxLayout(self)
+        splitter = QSplitter(Qt.Horizontal)
+
+        left = QWidget()
+        l = QVBoxLayout(left)
+
+        conn = QGroupBox("Bağlantı")
+        f = QFormLayout(conn)
+        self.port = QComboBox()
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.port.addItems(["udp:127.0.0.1:14550"] + ports)
+        self.baud = QComboBox()
+        self.baud.addItems(["57600","115200","921600"])
+        btn_conn = QPushButton("Bağlan")
+        btn_conn.clicked.connect(lambda: self.telemetry.connect_vehicle(self.port.currentText(), int(self.baud.currentText())))
+        f.addRow("Port", self.port)
+        f.addRow("Baud", self.baud)
+        f.addRow(btn_conn)
+        l.addWidget(conn)
+
+        state = QGroupBox("Durum")
+        s = QVBoxLayout(state)
+        self.lbl_mode = QLabel("Mod: ---")
+        self.lbl_arm = QLabel("ARM: ---")
+        self.lbl_pos = QLabel("Konum: ---")
+        self.lbl_speed = QLabel("Hız: ---")
+        self.lbl_bat = QLabel("Batarya: ---")
+        for w in [self.lbl_mode, self.lbl_arm, self.lbl_pos, self.lbl_speed, self.lbl_bat]:
+            s.addWidget(w)
+        l.addWidget(state)
+
+        motor = QGroupBox("Motor")
+        m = QHBoxLayout(motor)
+        b1 = QPushButton("ARM"); b1.clicked.connect(self.telemetry.arm)
+        b2 = QPushButton("DISARM"); b2.clicked.connect(self.telemetry.disarm)
+        m.addWidget(b1); m.addWidget(b2)
+        l.addWidget(motor)
+        l.addStretch()
+
+        center = QWebEngineView()
+        if self.mb.has_map:
+            center.setHtml(MAP_HTML_OFFLINE)
+        else:
+            center.setHtml("<html><body style='background:#111;color:#eee;'>MBTiles bulunamadı (turkey_offline.mbtiles)</body></html>")
+        self.map_view = center
+
+        right = QWidget()
+        r = QVBoxLayout(right)
+
+        pg.setConfigOption('background', '#121212')
+        pg.setConfigOption('foreground', '#e0e0e0')
+
+        self.g_speed = pg.PlotWidget(title="Hız (m/s)")
+        self.curve_speed = self.g_speed.plot(pen=pg.mkPen('#00e5ff', width=2))
+        r.addWidget(self.g_speed)
+
+        self.g_bat = pg.PlotWidget(title="Batarya (V)")
+        self.curve_bat = self.g_bat.plot(pen=pg.mkPen('#ff9800', width=2))
+        r.addWidget(self.g_bat)
+
+        self.lbl_log = QLabel("Log: hazır")
+        r.addWidget(self.lbl_log)
+
+        splitter.addWidget(left)
+        splitter.addWidget(center)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 1)
+
+        root.addWidget(splitter)
+
+    def on_data(self, lat, lon, speed, roll, pitch, yaw, mode, arm):
+        self.lbl_mode.setText(f"Mod: {mode}")
+        self.lbl_arm.setText(f"ARM: {arm}")
+        self.lbl_pos.setText(f"Konum: {lat:.6f}, {lon:.6f}")
+        self.lbl_speed.setText(f"Hız: {speed:.2f} m/s")
+        self.speed_hist.append(speed)
+        if self.mb.has_map:
+            self.map_view.page().runJavaScript(f"window.updateBoat({lat},{lon},{speed},'{mode}');")
+
+    def on_health(self, vbat, bat):
+        self.lbl_bat.setText(f"Batarya: {bat}% ({vbat:.2f}V)")
+        self.bat_hist.append(vbat)
+
+    def update_graphs(self):
+        if self.speed_hist:
+            self.curve_speed.setData(list(range(len(self.speed_hist))), list(self.speed_hist))
+        if self.bat_hist:
+            self.curve_bat.setData(list(range(len(self.bat_hist))), list(self.bat_hist))
+
+    def on_log(self, text):
+        self.lbl_log.setText(f"Log: {text}")
+
+    def closeEvent(self, e):
+        self.telemetry.stop()
+        self.mb.close()
+        e.accept()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec_())

@@ -15,10 +15,10 @@ from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional
 from enum import Enum
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QTimer, QInputDialog, QUrl
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QTimer, QUrl
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFormLayout, QComboBox, QGroupBox, QMessageBox,
+    QFormLayout, QComboBox, QGroupBox, QMessageBox, QInputDialog,
     QGridLayout, QScrollArea, QFileDialog, QSplitter, QTextEdit
 )
 from PyQt5.QtWebEngineWidgets import QWebEngineView

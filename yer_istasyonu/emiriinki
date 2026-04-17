@@ -36,7 +36,9 @@ TILE_SERVER_PORT = 8765
 MAX_WAYPOINTS = 4
 
 KILL_SERVO_CHANNEL = 9
-KILL_PWM = 1900
+KILL_PWM = 1900  # Donanıma göre 1900/2000 yapabilirsin
+
+MBTILES_FILE = "uydu_harita.mbtiles"
 
 MAP_HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -61,7 +63,8 @@ MAP_HTML_TEMPLATE = """
     const TILE_URL = "{tile_url}";
     const ENABLE_TILES = {enable_tiles};
 
-    const map = L.map('map').setView([39.0, 35.0], 7);
+    // Açılış noktası Trabzon (Akçaabat) ve Zoom 18
+    const map = L.map('map').setView([41.008694, 39.768233], 18);
 
     if (ENABLE_TILES) {{
       L.tileLayer(TILE_URL, {{ maxZoom:20, minZoom:5, tms:true }}).addTo(map);
@@ -163,8 +166,9 @@ MAP_HTML_TEMPLATE = """
 </html>
 """
 
+
 class MBTilesManager:
-    def __init__(self, mbtiles_path="uydu_harita.mbtiles"):
+    def __init__(self, mbtiles_path: str = MBTILES_FILE):
         self.mbtiles_path = Path(mbtiles_path)
         self.conn = None
         self.has_offline_map = False
@@ -172,8 +176,8 @@ class MBTilesManager:
             try:
                 self.conn = sqlite3.connect(str(self.mbtiles_path), check_same_thread=False)
                 self.has_offline_map = True
-            except:
-                pass
+            except Exception:
+                self.has_offline_map = False
 
     def get_tile(self, zoom: int, x: int, y: int) -> Optional[bytes]:
         if not self.conn:
@@ -187,33 +191,34 @@ class MBTilesManager:
             row = cur.fetchone()
             cur.close()
             return row[0] if row else None
-        except:
+        except Exception:
             return None
 
     def close(self):
         if self.conn:
             self.conn.close()
 
+
 class OfflineTileHandler(BaseHTTPRequestHandler):
     mbtiles_manager = None
 
     def do_GET(self):
-        if self.path.startswith('/tile/'):
+        if self.path.startswith("/tile/"):
             try:
-                parts = self.path.split('/')
+                parts = self.path.split("/")
                 z, x, y = int(parts[2]), int(parts[3]), int(parts[4])
                 tile_data = self.mbtiles_manager.get_tile(z, x, y)
                 if tile_data:
                     self.send_response(200)
-                    self.send_header('Content-type', 'image/png')
-                    self.send_header('Content-Length', str(len(tile_data)))
-                    self.send_header('Cache-Control', 'max-age=2592000')
+                    self.send_header("Content-type", "image/png")
+                    self.send_header("Content-Length", str(len(tile_data)))
+                    self.send_header("Cache-Control", "max-age=2592000")
                     self.end_headers()
                     self.wfile.write(tile_data)
                 else:
                     self.send_response(404)
                     self.end_headers()
-            except:
+            except Exception:
                 self.send_response(500)
                 self.end_headers()
         else:
@@ -223,6 +228,7 @@ class OfflineTileHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+
 class OfflineTileServer(threading.Thread):
     def __init__(self, mbtiles_manager, port: int = TILE_SERVER_PORT):
         super().__init__(daemon=True)
@@ -230,8 +236,9 @@ class OfflineTileServer(threading.Thread):
         self.port = port
 
     def run(self):
-        server = HTTPServer(('127.0.0.1', self.port), OfflineTileHandler)
+        server = HTTPServer(("127.0.0.1", self.port), OfflineTileHandler)
         server.serve_forever()
+
 
 class VehicleMode(Enum):
     MANUAL = 0
@@ -241,9 +248,11 @@ class VehicleMode(Enum):
     HOLD = 16
     RTB = 6
 
+
 class VehicleType(Enum):
     IDA = "İDA"
     IHA = "İHA"
+
 
 @dataclass
 class Waypoint:
@@ -256,6 +265,7 @@ class Waypoint:
     yaw_angle: float = 0.0
     action: str = "WAYPOINT"
 
+
 @dataclass
 class Mission:
     name: str
@@ -265,11 +275,12 @@ class Mission:
 
     def to_dict(self):
         return {
-            'name': self.name,
-            'created_at': self.created_at or datetime.now().isoformat(),
-            'description': self.description,
-            'waypoints': [asdict(wp) for wp in self.waypoints]
+            "name": self.name,
+            "created_at": self.created_at or datetime.now().isoformat(),
+            "description": self.description,
+            "waypoints": [asdict(wp) for wp in self.waypoints],
         }
+
 
 class MissionManager:
     def __init__(self, missions_dir: str = "missions"):
@@ -281,16 +292,16 @@ class MissionManager:
     def _load_all_missions(self):
         for mission_file in self.missions_dir.glob("*.json"):
             try:
-                with open(mission_file, 'r', encoding='utf-8') as f:
+                with open(mission_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                wps = [Waypoint(**wp) for wp in data.get('waypoints', [])]
-                self.missions[data['name']] = Mission(
-                    name=data['name'],
+                wps = [Waypoint(**wp) for wp in data.get("waypoints", [])]
+                self.missions[data["name"]] = Mission(
+                    name=data["name"],
                     waypoints=wps,
-                    created_at=data.get('created_at', ''),
-                    description=data.get('description', '')
+                    created_at=data.get("created_at", ""),
+                    description=data.get("description", ""),
                 )
-            except:
+            except Exception:
                 pass
 
     def create_mission(self, name: str) -> bool:
@@ -303,16 +314,16 @@ class MissionManager:
         try:
             if mission_name not in self.missions:
                 return False
-            with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+            with open(csv_file, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(
                     f,
-                    fieldnames=['seq', 'latitude', 'longitude', 'altitude', 'delay_time', 'accept_radius', 'yaw_angle', 'action']
+                    fieldnames=["seq", "latitude", "longitude", "altitude", "delay_time", "accept_radius", "yaw_angle", "action"],
                 )
                 writer.writeheader()
                 for wp in self.missions[mission_name].waypoints:
                     writer.writerow(asdict(wp))
             return True
-        except:
+        except Exception:
             return False
 
     def save_mission(self, mission_name: str) -> bool:
@@ -320,10 +331,10 @@ class MissionManager:
             if mission_name not in self.missions:
                 return False
             json_file = self.missions_dir / f"{mission_name}.json"
-            with open(json_file, 'w', encoding='utf-8') as f:
+            with open(json_file, "w", encoding="utf-8") as f:
                 json.dump(self.missions[mission_name].to_dict(), f, indent=2, ensure_ascii=False)
             return True
-        except:
+        except Exception:
             return False
 
     def get_mission(self, mission_name: str) -> Optional[Mission]:
@@ -332,12 +343,14 @@ class MissionManager:
     def list_missions(self) -> List[str]:
         return list(self.missions.keys())
 
+
 class MapBridge(QObject):
     waypoint_added = pyqtSignal(float, float, int)
 
     @pyqtSlot(float, float, int)
     def waypointAdded(self, lat: float, lon: float, idx: int):
         self.waypoint_added.emit(lat, lon, idx)
+
 
 class VehicleThread(QThread):
     data_signal = pyqtSignal(float, float, float, float, float, float, float, str, str, float, float)
@@ -354,7 +367,7 @@ class VehicleThread(QThread):
 
     def connect_vehicle(self, connection_string: str, baudrate: int = 57600):
         try:
-            if connection_string.startswith('udp:') or connection_string.startswith('tcp:'):
+            if connection_string.startswith("udp:") or connection_string.startswith("tcp:"):
                 self.master = mavutil.mavlink_connection(connection_string)
             else:
                 self.master = mavutil.mavlink_connection(connection_string, baud=baudrate, timeout=1.0)
@@ -381,35 +394,38 @@ class VehicleThread(QThread):
         while self.is_running and self.master:
             try:
                 msg = self.master.recv_match(
-                    type=['GLOBAL_POSITION_INT', 'VFR_HUD', 'ATTITUDE', 'HEARTBEAT', 'SYS_STATUS', 'GPS_RAW_INT', 'STATUSTEXT'],
+                    type=["GLOBAL_POSITION_INT", "VFR_HUD", "ATTITUDE", "HEARTBEAT", "SYS_STATUS", "GPS_RAW_INT", "STATUSTEXT"],
                     blocking=False,
-                    timeout=0.1
+                    timeout=0.1,
                 )
                 if not msg:
                     time.sleep(0.01)
                     continue
 
                 mt = msg.get_type()
-                if mt == 'GLOBAL_POSITION_INT':
+                if mt == "GLOBAL_POSITION_INT":
                     lat, lon = msg.lat / 1e7, msg.lon / 1e7
                     alt = msg.relative_alt / 1000.0
-                elif mt == 'VFR_HUD':
+                elif mt == "VFR_HUD":
                     speed = msg.groundspeed
-                elif mt == 'ATTITUDE':
+                elif mt == "ATTITUDE":
                     roll, pitch, yaw = math.degrees(msg.roll), math.degrees(msg.pitch), math.degrees(msg.yaw)
                     if yaw < 0:
                         yaw += 360
-                elif mt == 'HEARTBEAT':
+                elif mt == "HEARTBEAT":
                     mode = mavutil.mode_string_v10(msg)
                     arm_status = "ARM" if (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) else "DISARM"
-                elif mt == 'GPS_RAW_INT':
+                elif mt == "GPS_RAW_INT":
                     gps_fix, uydu = msg.fix_type, msg.satellites_visible
-                elif mt == 'SYS_STATUS':
+                elif mt == "SYS_STATUS":
                     vbat = msg.voltage_battery / 1000.0
                     batt = msg.battery_remaining
                     self.health_signal.emit(vbat, batt, gps_fix, uydu)
-                elif mt == 'STATUSTEXT':
-                    text = msg.text.decode('utf-8', errors='ignore').upper()
+                elif mt == "STATUSTEXT":
+                    try:
+                        text = msg.text.decode("utf-8", errors="ignore").upper()
+                    except Exception:
+                        text = str(getattr(msg, "text", "")).upper()
                     if "COLOR" in text or "RENK" in text:
                         self.statustext_signal.emit(text)
 
@@ -418,7 +434,7 @@ class VehicleThread(QThread):
                     self.data_signal.emit(lat, lon, speed, alt, roll, pitch, yaw, mode, arm_status, yon_sp, hiz_sp)
                     last_emit_time = now
 
-            except:
+            except Exception:
                 pass
 
     def _send_servo(self, channel: int, pwm: int):
@@ -429,7 +445,7 @@ class VehicleThread(QThread):
             self.master.target_component,
             mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
             0,
-            channel, pwm, 0, 0, 0, 0, 0
+            channel, pwm, 0, 0, 0, 0, 0,
         )
 
     def trigger_kamikaze(self, pwm_value: int):
@@ -451,41 +467,73 @@ class VehicleThread(QThread):
             self.log_signal.emit(f"[{self.vehicle_type.value}] KILL hatası: {e}")
 
     def send_waypoint_mission(self, waypoints: List[Waypoint]):
+
         if not self.master:
+
             return
+
         if not waypoints:
+
             self.log_signal.emit(f"[{self.vehicle_type.value}] Mission boş.")
+
             return
+
 
         try:
+
             try:
+
                 self.master.mav.mission_clear_all_send(self.master.target_system, self.master.target_component)
+
                 time.sleep(0.2)
+
             except:
+
                 pass
 
+
             self.master.mav.mission_count_send(self.master.target_system, self.master.target_component, len(waypoints))
+
             time.sleep(0.2)
 
+
             for wp in waypoints:
+
                 self.master.mav.mission_item_int_send(
+
                     self.master.target_system,
+
                     self.master.target_component,
+
                     wp.seq,
+
                     mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+
                     mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+
                     0, 1,
+
                     wp.delay_time, wp.accept_radius, 0, wp.yaw_angle,
+
                     int(wp.latitude * 1e7),
+
                     int(wp.longitude * 1e7),
+
                     int(wp.altitude * 100)
+
                 )
+
                 time.sleep(0.12)
+
 
             self.log_signal.emit(f"[{self.vehicle_type.value}] Mission gönderildi.")
 
+
         except Exception as e:
+
             self.log_signal.emit(f"[{self.vehicle_type.value}] Mission hata: {e}")
+
+
 
     def arm_vehicle(self):
         if self.master:
@@ -508,7 +556,7 @@ class VehicleThread(QThread):
             self.master.mav.set_mode_send(
                 self.master.target_system,
                 mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-                mode.value
+                mode.value,
             )
 
     def disconnect(self):
@@ -516,9 +564,10 @@ class VehicleThread(QThread):
         if self.master:
             try:
                 self.master.close()
-            except:
+            except Exception:
                 pass
         self.connected_signal.emit(False)
+
 
 class HorizonIndicator(QWidget):
     def __init__(self, parent=None):
@@ -556,10 +605,11 @@ class HorizonIndicator(QWidget):
         painter.drawLine(int(w / 2 + 8), int(h / 2), int(w / 2 + 25), int(h / 2))
         painter.drawLine(int(w / 2), int(h / 2 - 4), int(w / 2), int(h / 2 + 4))
 
+
 class YerKontrolIstasyonu(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("İDA YER KONTROL İSTASYONU - SAHA FINAL (CLEAN)")
+        self.setWindowTitle("İDA YER KONTROL İSTASYONU - SAHA FINAL (DENEME FIX)")
         self.setGeometry(30, 30, 1800, 1000)
 
         self.log_dir = Path.cwd() / "logs"
@@ -573,7 +623,7 @@ class YerKontrolIstasyonu(QWidget):
         self.flush_timer.timeout.connect(self.auto_flush_log)
         self.flush_timer.start(2000)
 
-        self.mbtiles_manager = MBTilesManager("uydu_harita.mbtiles")
+        self.mbtiles_manager = MBTilesManager(MBTILES_FILE)
         self.tile_server = None
         if self.mbtiles_manager.has_offline_map:
             self.tile_server = OfflineTileServer(self.mbtiles_manager, port=TILE_SERVER_PORT)
@@ -617,7 +667,7 @@ class YerKontrolIstasyonu(QWidget):
             try:
                 self.log_fp.flush()
                 self.log_fp.close()
-            except:
+            except Exception:
                 pass
 
         log_name = self.log_dir / f"ida_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -630,7 +680,7 @@ class YerKontrolIstasyonu(QWidget):
             try:
                 self.log_fp.flush()
                 os.fsync(self.log_fp.fileno())
-            except:
+            except Exception:
                 pass
 
     def select_log_folder(self):
@@ -667,10 +717,9 @@ class YerKontrolIstasyonu(QWidget):
         self.ida_baud_combo.addItems(["57600", "115200"])
 
         btn_ida_conn = QPushButton("Bağlan")
-        btn_ida_conn.clicked.connect(lambda: self.ida_thread.connect_vehicle(
-            self.ida_port_combo.currentText(), int(self.ida_baud_combo.currentText())
-        ))
-
+        btn_ida_conn.clicked.connect(
+            lambda: self.ida_thread.connect_vehicle(self.ida_port_combo.currentText(), int(self.ida_baud_combo.currentText()))
+        )
         ida_conn_layout.addRow("Port:", self.ida_port_combo)
         ida_conn_layout.addRow("Baud:", self.ida_baud_combo)
         ida_conn_layout.addRow("", btn_ida_conn)
@@ -695,10 +744,16 @@ class YerKontrolIstasyonu(QWidget):
 
         btn_ida_arm = QPushButton("ARM")
         btn_ida_arm.clicked.connect(self.ida_thread.arm_vehicle)
+
         btn_ida_disarm = QPushButton("DISARM")
         btn_ida_disarm.clicked.connect(self.ida_thread.disarm_vehicle)
+
         btn_ida_auto = QPushButton("AUTO")
         btn_ida_auto.clicked.connect(lambda: self.ida_thread.set_mode(VehicleMode.AUTO))
+
+        btn_ida_manual = QPushButton("MANUAL (DUR)")
+        btn_ida_manual.setStyleSheet("background:#e65100;color:white;")
+        btn_ida_manual.clicked.connect(lambda: self.ida_thread.set_mode(VehicleMode.MANUAL))
 
         btn_kill = QPushButton("🛑 ACİL KILL")
         btn_kill.setStyleSheet("background:#b71c1c;color:white;")
@@ -707,15 +762,16 @@ class YerKontrolIstasyonu(QWidget):
         ida_motor_layout.addWidget(btn_ida_arm, 0, 0)
         ida_motor_layout.addWidget(btn_ida_disarm, 0, 1)
         ida_motor_layout.addWidget(btn_ida_auto, 1, 0)
-        ida_motor_layout.addWidget(btn_kill, 1, 1)
+        ida_motor_layout.addWidget(btn_ida_manual, 1, 1)
+        ida_motor_layout.addWidget(btn_kill, 2, 0, 1, 2)
 
         btn_clear = QPushButton("🧹 HARİTAYI TEMİZLE")
         btn_clear.clicked.connect(self.clear_mission_everywhere)
-        ida_motor_layout.addWidget(btn_clear, 2, 0, 1, 2)
+        ida_motor_layout.addWidget(btn_clear, 3, 0, 1, 2)
 
         btn_follow = QPushButton("🎯 FOLLOW: ON/OFF")
         btn_follow.clicked.connect(self.toggle_follow)
-        ida_motor_layout.addWidget(btn_follow, 3, 0, 1, 2)
+        ida_motor_layout.addWidget(btn_follow, 4, 0, 1, 2)
 
         ida_motor_group.setLayout(ida_motor_layout)
         left_layout.addWidget(ida_motor_group)
@@ -726,10 +782,11 @@ class YerKontrolIstasyonu(QWidget):
 
         center_widget = QWidget()
         center_layout = QVBoxLayout(center_widget)
-        self.map_view = QWebEngineView()
 
+        self.map_view = QWebEngineView()
         leaflet_js_path = Path.cwd() / "leaflet" / "leaflet.js"
         leaflet_css_path = Path.cwd() / "leaflet" / "leaflet.css"
+
         if not (leaflet_js_path.exists() and leaflet_css_path.exists()):
             self.map_view.setHtml(
                 "<html><body style='background:#121212;color:#ff5252;font-family:Arial;padding:20px;'>"
@@ -738,10 +795,11 @@ class YerKontrolIstasyonu(QWidget):
         else:
             current_dir = os.path.dirname(os.path.abspath(__file__))
             base_url = QUrl.fromLocalFile(current_dir + os.sep)
+
             html = MAP_HTML_TEMPLATE.format(
                 tile_url=f"http://127.0.0.1:{TILE_SERVER_PORT}/tile/{{z}}/{{x}}/{{y}}",
                 enable_tiles="true" if self.mbtiles_manager.has_offline_map else "false",
-                max_wps=MAX_WAYPOINTS
+                max_wps=MAX_WAYPOINTS,
             )
             self.map_view.setHtml(html, base_url)
 
@@ -753,6 +811,7 @@ class YerKontrolIstasyonu(QWidget):
 
         mission_group = QGroupBox("Görev Yönetimi")
         mission_layout = QVBoxLayout()
+
         self.mission_combo = QComboBox()
         self._refresh_mission_list()
         mission_layout.addWidget(self.mission_combo)
@@ -782,10 +841,10 @@ class YerKontrolIstasyonu(QWidget):
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
 
-        pg.setConfigOption('background', '#121212')
-        pg.setConfigOption('foreground', '#e0e0e0')
+        pg.setConfigOption("background", "#121212")
+        pg.setConfigOption("foreground", "#e0e0e0")
         self.plot_speed_widget = pg.PlotWidget(title="İDA Hızı (m/s)")
-        self.curve_speed = self.plot_speed_widget.plot(pen=pg.mkPen('#00e5ff', width=2))
+        self.curve_speed = self.plot_speed_widget.plot(pen=pg.mkPen("#00e5ff", width=2))
         right_layout.addWidget(self.plot_speed_widget)
 
         iha_conn_group = QGroupBox("İHA Bağlantısı")
@@ -810,6 +869,7 @@ class YerKontrolIstasyonu(QWidget):
         self.log_text = QTextEdit()
         self.log_text.setMaximumHeight(160)
         right_layout.addWidget(self.log_text)
+
         right_layout.addStretch()
 
         splitter = QSplitter(Qt.Horizontal)
@@ -845,9 +905,10 @@ class YerKontrolIstasyonu(QWidget):
 
     def confirm_kill(self):
         ret = QMessageBox.question(
-            self, "ACİL KILL",
+            self,
+            "ACİL KILL",
             f"Araç gücü kesilsin mi?\nCH{KILL_SERVO_CHANNEL} -> PWM {KILL_PWM}",
-            QMessageBox.Yes | QMessageBox.No
+            QMessageBox.Yes | QMessageBox.No,
         )
         if ret == QMessageBox.Yes:
             self.ida_thread.kill_power()
@@ -892,19 +953,6 @@ class YerKontrolIstasyonu(QWidget):
     @pyqtSlot(str)
     def on_iha_statustext(self, text: str):
         self.log_message(f"[İHA] {text}")
-        if "KIRMIZI" in text:
-            pwm = 1000
-        elif "MAVİ" in text:
-            pwm = 1500
-        elif "YEŞİL" in text:
-            pwm = 2000
-        else:
-            return
-
-        if not self.kamikaze_active:
-            self.kamikaze_active = True
-            self.ida_thread.trigger_kamikaze(pwm)
-            QTimer.singleShot(5000, lambda: setattr(self, 'kamikaze_active', False))
 
     @pyqtSlot(str)
     def on_ida_statustext(self, text: str):
@@ -975,11 +1023,12 @@ class YerKontrolIstasyonu(QWidget):
             if self.log_fp:
                 self.log_fp.flush()
                 self.log_fp.close()
-        except:
+        except Exception:
             pass
         if self.mbtiles_manager:
             self.mbtiles_manager.close()
         event.accept()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

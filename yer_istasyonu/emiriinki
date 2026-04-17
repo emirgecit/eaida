@@ -64,7 +64,7 @@ MAP_HTML_TEMPLATE = """
     const map = L.map('map').setView([39.0, 35.0], 7);
 
     if (ENABLE_TILES) {{
-      L.tileLayer(TILE_URL, {{ maxZoom:18, minZoom:5, tms:true }}).addTo(map);
+      L.tileLayer(TILE_URL, {{ maxZoom:20, minZoom:5, tms:true }}).addTo(map);
     }} else {{
       const err = L.control({{position:'topright'}});
       err.onAdd = function() {{
@@ -164,7 +164,7 @@ MAP_HTML_TEMPLATE = """
 """
 
 class MBTilesManager:
-    def __init__(self, mbtiles_path="turkey_offline.mbtiles"):
+    def __init__(self, mbtiles_path="uydu_harita.mbtiles"):
         self.mbtiles_path = Path(mbtiles_path)
         self.conn = None
         self.has_offline_map = False
@@ -492,7 +492,7 @@ class VehicleThread(QThread):
             self.master.mav.command_long_send(
                 self.master.target_system, self.master.target_component,
                 mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
-                1, 0, 0, 0, 0, 0, 0
+                1, 21196, 0, 0, 0, 0, 0
             )
 
     def disarm_vehicle(self):
@@ -573,7 +573,7 @@ class YerKontrolIstasyonu(QWidget):
         self.flush_timer.timeout.connect(self.auto_flush_log)
         self.flush_timer.start(2000)
 
-        self.mbtiles_manager = MBTilesManager("turkey_offline.mbtiles")
+        self.mbtiles_manager = MBTilesManager("uydu_harita.mbtiles")
         self.tile_server = None
         if self.mbtiles_manager.has_offline_map:
             self.tile_server = OfflineTileServer(self.mbtiles_manager, port=TILE_SERVER_PORT)

@@ -1,0 +1,1993 @@
+#!/usr/bin/env python3
+import sys
+import os
+import math
+import time
+import csv
+import json
+import sqlite3
+import threading
+from datetime import datetime
+from collections import deque
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional
+from enum import Enum
+
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QTimer, QUrl
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QFormLayout, QComboBox, QGroupBox, QMessageBox, QInputDialog,
+    QGridLayout, QScrollArea, QFileDialog, QSplitter, QTextEdit
+)
+from PyQt5.QtWebEngineWidgets import QWebEngineView
+from PyQt5.QtWebChannel import QWebChannel
+from PyQt5.QtGui import QPainter, QColor, QPen
+
+import pyqtgraph as pg
+import serial.tools.list_ports
+from pymavlink import mavutil
+
+os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu"
+
+TILE_SERVER_PORT = 8765
+MAX_WAYPOINTS = 4
+
+KILL_SERVO_CHANNEL = 9
+KILL_PWM = 1900  # Donanıma göre 1900/2000 yapabilirsin
+
+MBTILES_FILE = "uydu_harita.mbtiles"
+
+MAP_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <link rel="stylesheet" href="leaflet/leaflet.css"/>
+  <script src="leaflet/leaflet.js"></script>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <style>
+    html, body, #map {{ height:100%; width:100%; margin:0; padding:0; background:#121212; }}
+    .info-panel {{ background: rgba(30, 30, 30, 0.95); color: #e0e0e0; padding: 10px; border-radius: 5px; border: 2px solid #00e5ff; font-size: 11px; line-height: 1.5; }}
+    .badge {{ position:fixed; left:10px; bottom:10px; background:#2e7d32; color:#fff; padding:6px 10px; border-radius:4px; font-size:11px; z-index:9999; }}
+    .badge2 {{ position:fixed; left:10px; bottom:44px; background:#263238; color:#fff; padding:6px 10px; border-radius:4px; font-size:11px; z-index:9999; opacity:0.9; }}
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div class="badge">OFFLINE MAP (MBTiles)</div>
+<div class="badge2" id="followBadge">FOLLOW: ON</div>
+<script>
+    const TILE_URL = "{tile_url}";
+    const ENABLE_TILES = {enable_tiles};
+
+    // Açılış noktası Trabzon (Akçaabat) ve Zoom 18
+    const map = L.map('map').setView([41.008694, 39.768233], 18);
+
+    if (ENABLE_TILES) {{
+      L.tileLayer(TILE_URL, {{ maxZoom:20, minZoom:5, tms:true }}).addTo(map);
+    }} else {{
+      const err = L.control({{position:'topright'}});
+      err.onAdd = function() {{
+        const div = L.DomUtil.create('div', 'info-panel');
+        div.innerHTML = "<b>MBTiles / Tile Server yok</b><br>Harita kapalı, telemetri çalışır.";
+        return div;
+      }}
+      err.addTo(map);
+    }}
+
+    let bridge = null;
+
+    let idaMarker = null, idaPath = [], idaPolyline = L.polyline([], {{color: '#00e5ff', weight: 2, opacity: 0.7}}).addTo(map);
+    let ihaMarker = null, ihaPath = [], ihaPolyline = L.polyline([], {{color: '#d50000', weight: 2, opacity: 0.7}}).addTo(map);
+
+    let waypointMarkers = [], waypointPolyline = null, missionLayer = L.layerGroup().addTo(map);
+
+    window.suppressBridge = false;
+    window.followMode = true;
+
+    function updateFollowBadge() {{
+      document.getElementById("followBadge").innerText = "FOLLOW: " + (window.followMode ? "ON" : "OFF");
+    }}
+    updateFollowBadge();
+
+    new QWebChannel(qt.webChannelTransport, function(channel) {{
+        bridge = channel.objects.bridge;
+    }});
+
+    map.on('click', function(e) {{
+        if (waypointMarkers.length < {max_wps}) {{
+            window.addMissionWaypoint(e.latlng.lat, e.latlng.lng);
+        }}
+    }});
+
+    window.setFollowMode = function(on) {{
+      window.followMode = !!on;
+      updateFollowBadge();
+    }}
+
+    window.addMissionWaypoint = function(lat, lon) {{
+        let idx = waypointMarkers.length;
+        let marker = L.marker([lat, lon], {{
+            icon: L.divIcon({{
+                html: '<div style="background-color: #ff9100; color: white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; font-weight: bold; border: 2px solid white; font-size: 14px;">' + (idx + 1) + '</div>',
+                iconSize: [32, 32],
+                iconAnchor: [16, 16]
+            }})
+        }}).bindPopup('<div class="info-panel"><b>WP ' + (idx + 1) + '</b><br>Lat: ' + lat.toFixed(6) + '<br>Lon: ' + lon.toFixed(6) + '</div>');
+
+        marker.addTo(missionLayer);
+        waypointMarkers.push({{marker: marker, lat: lat, lon: lon}});
+
+        if (bridge && !window.suppressBridge) bridge.waypointAdded(lat, lon, idx);
+        window.updateMissionLine();
+    }};
+
+    window.updateMissionLine = function() {{
+        if (waypointPolyline) missionLayer.removeLayer(waypointPolyline);
+        let coords = waypointMarkers.map(w => [w.lat, w.lon]);
+        waypointPolyline = L.polyline(coords, {{color: '#ff9800', weight: 2, dashArray: '5, 5', opacity: 0.7}});
+        waypointPolyline.addTo(missionLayer);
+    }};
+
+    window.clearMission = function() {{
+        waypointMarkers.forEach(w => missionLayer.removeLayer(w.marker));
+        waypointMarkers = [];
+        if (waypointPolyline) missionLayer.removeLayer(waypointPolyline);
+    }};
+
+    window.updateIdaPosition = function(lat, lon, heading, speed, mode) {{
+        if (!idaMarker) {{
+            idaMarker = L.circleMarker([lat, lon], {{radius: 8, fillColor: '#4caf50', color: '#fff', weight: 2, opacity: 1, fillOpacity: 0.8}}).addTo(map);
+        }}
+        idaMarker.setLatLng([lat, lon]);
+        idaPath.push([lat, lon]);
+        if (idaPath.length > 500) idaPath.shift();
+        idaPolyline.setLatLngs(idaPath);
+
+        if (window.followMode) {{
+          map.setView([lat, lon], map.getZoom());
+        }}
+    }};
+
+    window.updateIhaPosition = function(lat, lon, heading, altitude, mode) {{
+        if (!ihaMarker) {{
+            ihaMarker = L.circleMarker([lat, lon], {{radius: 6, fillColor: '#d50000', color: '#fff', weight: 2, opacity: 1, fillOpacity: 0.8}}).addTo(map);
+        }}
+        ihaMarker.setLatLng([lat, lon]);
+        ihaPath.push([lat, lon]);
+        if (ihaPath.length > 500) ihaPath.shift();
+        ihaPolyline.setLatLngs(ihaPath);
+    }};
+</script>
+</body>
+</html>
+"""
+
+
+class MBTilesManager:
+    def __init__(self, mbtiles_path: str = MBTILES_FILE):
+        self.mbtiles_path = Path(mbtiles_path)
+        self.conn = None
+        self.has_offline_map = False
+        if self.mbtiles_path.exists():
+            try:
+                self.conn = sqlite3.connect(str(self.mbtiles_path), check_same_thread=False)
+                self.has_offline_map = True
+            except Exception:
+                self.has_offline_map = False
+
+    def get_tile(self, zoom: int, x: int, y: int) -> Optional[bytes]:
+        if not self.conn:
+            return None
+        try:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
+                (zoom, x, y)
+            )
+            row = cur.fetchone()
+            cur.close()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+
+class OfflineTileHandler(BaseHTTPRequestHandler):
+    mbtiles_manager = None
+
+    def do_GET(self):
+        if self.path.startswith("/tile/"):
+            try:
+                parts = self.path.split("/")
+                z, x, y = int(parts[2]), int(parts[3]), int(parts[4])
+                tile_data = self.mbtiles_manager.get_tile(z, x, y)
+                if tile_data:
+                    self.send_response(200)
+                    self.send_header("Content-type", "image/png")
+                    self.send_header("Content-Length", str(len(tile_data)))
+                    self.send_header("Cache-Control", "max-age=2592000")
+                    self.end_headers()
+                    self.wfile.write(tile_data)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            except Exception:
+                self.send_response(500)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+class OfflineTileServer(threading.Thread):
+    def __init__(self, mbtiles_manager, port: int = TILE_SERVER_PORT):
+        super().__init__(daemon=True)
+        OfflineTileHandler.mbtiles_manager = mbtiles_manager
+        self.port = port
+
+    def run(self):
+        server = HTTPServer(("127.0.0.1", self.port), OfflineTileHandler)
+        server.serve_forever()
+
+
+class VehicleMode(Enum):
+    MANUAL = 0
+    GUIDED = 4
+    AUTO = 10
+    LOITER = 5
+    HOLD = 16
+    RTB = 6
+
+
+class VehicleType(Enum):
+    IDA = "İDA"
+    IHA = "İHA"
+
+
+@dataclass
+class Waypoint:
+    seq: int
+    latitude: float
+    longitude: float
+    altitude: float = 5.0
+    delay_time: float = 0.0
+    accept_radius: float = 1.5
+    yaw_angle: float = 0.0
+    action: str = "WAYPOINT"
+
+
+@dataclass
+class Mission:
+    name: str
+    waypoints: List[Waypoint]
+    created_at: str = ""
+    description: str = ""
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "created_at": self.created_at or datetime.now().isoformat(),
+            "description": self.description,
+            "waypoints": [asdict(wp) for wp in self.waypoints],
+        }
+
+
+class MissionManager:
+    def __init__(self, missions_dir: str = "missions"):
+        self.missions_dir = Path(missions_dir)
+        self.missions_dir.mkdir(exist_ok=True)
+        self.missions: Dict[str, Mission] = {}
+        self._load_all_missions()
+
+    def _load_all_missions(self):
+        for mission_file in self.missions_dir.glob("*.json"):
+            try:
+                with open(mission_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                wps = [Waypoint(**wp) for wp in data.get("waypoints", [])]
+                self.missions[data["name"]] = Mission(
+                    name=data["name"],
+                    waypoints=wps,
+                    created_at=data.get("created_at", ""),
+                    description=data.get("description", ""),
+                )
+            except Exception:
+                pass
+
+    def create_mission(self, name: str) -> bool:
+        if name in self.missions:
+            return False
+        self.missions[name] = Mission(name=name, waypoints=[], created_at=datetime.now().isoformat())
+        return self.save_mission(name)
+
+    def export_csv(self, mission_name: str, csv_file: str) -> bool:
+        try:
+            if mission_name not in self.missions:
+                return False
+            with open(csv_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["seq", "latitude", "longitude", "altitude", "delay_time", "accept_radius", "yaw_angle", "action"],
+                )
+                writer.writeheader()
+                for wp in self.missions[mission_name].waypoints:
+                    writer.writerow(asdict(wp))
+            return True
+        except Exception:
+            return False
+
+    def save_mission(self, mission_name: str) -> bool:
+        try:
+            if mission_name not in self.missions:
+                return False
+            json_file = self.missions_dir / f"{mission_name}.json"
+            with open(json_file, "w", encoding="utf-8") as f:
+                json.dump(self.missions[mission_name].to_dict(), f, indent=2, ensure_ascii=False)
+            return True
+        except Exception:
+            return False
+
+    def get_mission(self, mission_name: str) -> Optional[Mission]:
+        return self.missions.get(mission_name)
+
+    def list_missions(self) -> List[str]:
+        return list(self.missions.keys())
+
+
+class MapBridge(QObject):
+    waypoint_added = pyqtSignal(float, float, int)
+
+    @pyqtSlot(float, float, int)
+    def waypointAdded(self, lat: float, lon: float, idx: int):
+        self.waypoint_added.emit(lat, lon, idx)
+
+
+class VehicleThread(QThread):
+    data_signal = pyqtSignal(float, float, float, float, float, float, float, str, str, float, float)
+    health_signal = pyqtSignal(float, int, int, int)
+    log_signal = pyqtSignal(str)
+    connected_signal = pyqtSignal(bool)
+    statustext_signal = pyqtSignal(str)
+
+    def __init__(self, vehicle_type: VehicleType):
+        super().__init__()
+        self.vehicle_type = vehicle_type
+        self.master = None
+        self.is_running = False
+
+    def connect_vehicle(self, connection_string: str, baudrate: int = 57600):
+        try:
+            if connection_string.startswith("udp:") or connection_string.startswith("tcp:"):
+                self.master = mavutil.mavlink_connection(connection_string)
+            else:
+                self.master = mavutil.mavlink_connection(connection_string, baud=baudrate, timeout=1.0)
+
+            self.master.wait_heartbeat(timeout=5)
+            self.is_running = True
+            self.connected_signal.emit(True)
+            self.log_signal.emit(f"[{self.vehicle_type.value}] Bağlantı başarılı: {connection_string}")
+            self.start()
+        except Exception as e:
+            self.is_running = False
+            self.connected_signal.emit(False)
+            self.log_signal.emit(f"[{self.vehicle_type.value}] Bağlantı hatası: {e}")
+
+    def run(self):
+        lat = lon = speed = alt = roll = pitch = yaw = 0.0
+        yon_sp = hiz_sp = 0.0
+        mode = "---"
+        arm_status = "DISARM"
+        gps_fix = 0
+        uydu = 0
+        last_emit_time = 0.0
+
+        while self.is_running and self.master:
+            try:
+                msg = self.master.recv_match(
+                    type=["GLOBAL_POSITION_INT", "VFR_HUD", "ATTITUDE", "HEARTBEAT", "SYS_STATUS", "GPS_RAW_INT", "STATUSTEXT"],
+                    blocking=False,
+                    timeout=0.1,
+                )
+                if not msg:
+                    time.sleep(0.01)
+                    continue
+
+                mt = msg.get_type()
+                if mt == "GLOBAL_POSITION_INT":
+                    lat, lon = msg.lat / 1e7, msg.lon / 1e7
+                    alt = msg.relative_alt / 1000.0
+                elif mt == "VFR_HUD":
+                    speed = msg.groundspeed
+                elif mt == "ATTITUDE":
+                    roll, pitch, yaw = math.degrees(msg.roll), math.degrees(msg.pitch), math.degrees(msg.yaw)
+                    if yaw < 0:
+                        yaw += 360
+                elif mt == "HEARTBEAT":
+                    mode = mavutil.mode_string_v10(msg)
+                    arm_status = "ARM" if (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) else "DISARM"
+                elif mt == "GPS_RAW_INT":
+                    gps_fix, uydu = msg.fix_type, msg.satellites_visible
+                elif mt == "SYS_STATUS":
+                    vbat = msg.voltage_battery / 1000.0
+                    batt = msg.battery_remaining
+                    self.health_signal.emit(vbat, batt, gps_fix, uydu)
+                elif mt == "STATUSTEXT":
+                    try:
+                        text = msg.text.decode("utf-8", errors="ignore").upper()
+                    except Exception:
+                        text = str(getattr(msg, "text", "")).upper()
+                    if "COLOR" in text or "RENK" in text:
+                        self.statustext_signal.emit(text)
+
+                now = time.time()
+                if now - last_emit_time >= 0.1:
+                    self.data_signal.emit(lat, lon, speed, alt, roll, pitch, yaw, mode, arm_status, yon_sp, hiz_sp)
+                    last_emit_time = now
+
+            except Exception:
+                pass
+
+    def _send_servo(self, channel: int, pwm: int):
+        if not self.master:
+            return
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+            0,
+            channel, pwm, 0, 0, 0, 0, 0,
+        )
+
+    def trigger_kamikaze(self, pwm_value: int):
+        if not self.master:
+            return
+        try:
+            self._send_servo(KILL_SERVO_CHANNEL, pwm_value)
+            self.log_signal.emit(f"[{self.vehicle_type.value}] KAMIKAZE: CH{KILL_SERVO_CHANNEL} -> {pwm_value}")
+        except Exception as e:
+            self.log_signal.emit(f"[{self.vehicle_type.value}] Kamikaze hatası: {e}")
+
+    def kill_power(self):
+        if not self.master:
+            return
+        try:
+            self._send_servo(KILL_SERVO_CHANNEL, KILL_PWM)
+            self.log_signal.emit(f"[{self.vehicle_type.value}] 🛑 KILL: CH{KILL_SERVO_CHANNEL} -> {KILL_PWM}")
+        except Exception as e:
+            self.log_signal.emit(f"[{self.vehicle_type.value}] KILL hatası: {e}")
+
+#!/usr/bin/env python3
+import sys
+import os
+import math
+import time
+import csv
+import json
+import sqlite3
+import threading
+from datetime import datetime
+from collections import deque
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional
+from enum import Enum
+
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QTimer, QUrl
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QFormLayout, QComboBox, QGroupBox, QMessageBox, QInputDialog,
+    QGridLayout, QScrollArea, QFileDialog, QSplitter, QTextEdit
+)
+from PyQt5.QtWebEngineWidgets import QWebEngineView
+from PyQt5.QtWebChannel import QWebChannel
+from PyQt5.QtGui import QPainter, QColor, QPen
+
+import pyqtgraph as pg
+import serial.tools.list_ports
+from pymavlink import mavutil
+
+os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = "--disable-gpu"
+
+TILE_SERVER_PORT = 8765
+MAX_WAYPOINTS = 4
+
+KILL_SERVO_CHANNEL = 9
+KILL_PWM = 1900  # Donanıma göre 1900/2000 yapabilirsin
+
+MBTILES_FILE = "uydu_harita.mbtiles"
+
+MAP_HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <link rel="stylesheet" href="leaflet/leaflet.css"/>
+  <script src="leaflet/leaflet.js"></script>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <style>
+    html, body, #map {{ height:100%; width:100%; margin:0; padding:0; background:#121212; }}
+    .info-panel {{ background: rgba(30, 30, 30, 0.95); color: #e0e0e0; padding: 10px; border-radius: 5px; border: 2px solid #00e5ff; font-size: 11px; line-height: 1.5; }}
+    .badge {{ position:fixed; left:10px; bottom:10px; background:#2e7d32; color:#fff; padding:6px 10px; border-radius:4px; font-size:11px; z-index:9999; }}
+    .badge2 {{ position:fixed; left:10px; bottom:44px; background:#263238; color:#fff; padding:6px 10px; border-radius:4px; font-size:11px; z-index:9999; opacity:0.9; }}
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div class="badge">OFFLINE MAP (MBTiles)</div>
+<div class="badge2" id="followBadge">FOLLOW: ON</div>
+<script>
+    const TILE_URL = "{tile_url}";
+    const ENABLE_TILES = {enable_tiles};
+
+    // Açılış noktası Trabzon (Akçaabat) ve Zoom 18
+    const map = L.map('map').setView([41.008694, 39.768233], 18);
+
+    if (ENABLE_TILES) {{
+      L.tileLayer(TILE_URL, {{ maxZoom:20, minZoom:5, tms:true }}).addTo(map);
+    }} else {{
+      const err = L.control({{position:'topright'}});
+      err.onAdd = function() {{
+        const div = L.DomUtil.create('div', 'info-panel');
+        div.innerHTML = "<b>MBTiles / Tile Server yok</b><br>Harita kapalı, telemetri çalışır.";
+        return div;
+      }}
+      err.addTo(map);
+    }}
+
+    let bridge = null;
+
+    let idaMarker = null, idaPath = [], idaPolyline = L.polyline([], {{color: '#00e5ff', weight: 2, opacity: 0.7}}).addTo(map);
+    let ihaMarker = null, ihaPath = [], ihaPolyline = L.polyline([], {{color: '#d50000', weight: 2, opacity: 0.7}}).addTo(map);
+
+    let waypointMarkers = [], waypointPolyline = null, missionLayer = L.layerGroup().addTo(map);
+
+    window.suppressBridge = false;
+    window.followMode = true;
+
+    function updateFollowBadge() {{
+      document.getElementById("followBadge").innerText = "FOLLOW: " + (window.followMode ? "ON" : "OFF");
+    }}
+    updateFollowBadge();
+
+    new QWebChannel(qt.webChannelTransport, function(channel) {{
+        bridge = channel.objects.bridge;
+    }});
+
+    map.on('click', function(e) {{
+        if (waypointMarkers.length < {max_wps}) {{
+            window.addMissionWaypoint(e.latlng.lat, e.latlng.lng);
+        }}
+    }});
+
+    window.setFollowMode = function(on) {{
+      window.followMode = !!on;
+      updateFollowBadge();
+    }}
+
+    window.addMissionWaypoint = function(lat, lon) {{
+        let idx = waypointMarkers.length;
+        let marker = L.marker([lat, lon], {{
+            icon: L.divIcon({{
+                html: '<div style="background-color: #ff9100; color: white; border-radius: 50%; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; font-weight: bold; border: 2px solid white; font-size: 14px;">' + (idx + 1) + '</div>',
+                iconSize: [32, 32],
+                iconAnchor: [16, 16]
+            }})
+        }}).bindPopup('<div class="info-panel"><b>WP ' + (idx + 1) + '</b><br>Lat: ' + lat.toFixed(6) + '<br>Lon: ' + lon.toFixed(6) + '</div>');
+
+        marker.addTo(missionLayer);
+        waypointMarkers.push({{marker: marker, lat: lat, lon: lon}});
+
+        if (bridge && !window.suppressBridge) bridge.waypointAdded(lat, lon, idx);
+        window.updateMissionLine();
+    }};
+
+    window.updateMissionLine = function() {{
+        if (waypointPolyline) missionLayer.removeLayer(waypointPolyline);
+        let coords = waypointMarkers.map(w => [w.lat, w.lon]);
+        waypointPolyline = L.polyline(coords, {{color: '#ff9800', weight: 2, dashArray: '5, 5', opacity: 0.7}});
+        waypointPolyline.addTo(missionLayer);
+    }};
+
+    window.clearMission = function() {{
+        waypointMarkers.forEach(w => missionLayer.removeLayer(w.marker));
+        waypointMarkers = [];
+        if (waypointPolyline) missionLayer.removeLayer(waypointPolyline);
+    }};
+
+    window.updateIdaPosition = function(lat, lon, heading, speed, mode) {{
+        if (!idaMarker) {{
+            idaMarker = L.circleMarker([lat, lon], {{radius: 8, fillColor: '#4caf50', color: '#fff', weight: 2, opacity: 1, fillOpacity: 0.8}}).addTo(map);
+        }}
+        idaMarker.setLatLng([lat, lon]);
+        idaPath.push([lat, lon]);
+        if (idaPath.length > 500) idaPath.shift();
+        idaPolyline.setLatLngs(idaPath);
+
+        if (window.followMode) {{
+          map.setView([lat, lon], map.getZoom());
+        }}
+    }};
+
+    window.updateIhaPosition = function(lat, lon, heading, altitude, mode) {{
+        if (!ihaMarker) {{
+            ihaMarker = L.circleMarker([lat, lon], {{radius: 6, fillColor: '#d50000', color: '#fff', weight: 2, opacity: 1, fillOpacity: 0.8}}).addTo(map);
+        }}
+        ihaMarker.setLatLng([lat, lon]);
+        ihaPath.push([lat, lon]);
+        if (ihaPath.length > 500) ihaPath.shift();
+        ihaPolyline.setLatLngs(ihaPath);
+    }};
+</script>
+</body>
+</html>
+"""
+
+
+class MBTilesManager:
+    def __init__(self, mbtiles_path: str = MBTILES_FILE):
+        self.mbtiles_path = Path(mbtiles_path)
+        self.conn = None
+        self.has_offline_map = False
+        if self.mbtiles_path.exists():
+            try:
+                self.conn = sqlite3.connect(str(self.mbtiles_path), check_same_thread=False)
+                self.has_offline_map = True
+            except Exception:
+                self.has_offline_map = False
+
+    def get_tile(self, zoom: int, x: int, y: int) -> Optional[bytes]:
+        if not self.conn:
+            return None
+        try:
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
+                (zoom, x, y)
+            )
+            row = cur.fetchone()
+            cur.close()
+            return row[0] if row else None
+        except Exception:
+            return None
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+
+class OfflineTileHandler(BaseHTTPRequestHandler):
+    mbtiles_manager = None
+
+    def do_GET(self):
+        if self.path.startswith("/tile/"):
+            try:
+                parts = self.path.split("/")
+                z, x, y = int(parts[2]), int(parts[3]), int(parts[4])
+                tile_data = self.mbtiles_manager.get_tile(z, x, y)
+                if tile_data:
+                    self.send_response(200)
+                    self.send_header("Content-type", "image/png")
+                    self.send_header("Content-Length", str(len(tile_data)))
+                    self.send_header("Cache-Control", "max-age=2592000")
+                    self.end_headers()
+                    self.wfile.write(tile_data)
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            except Exception:
+                self.send_response(500)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):
+        pass
+
+
+class OfflineTileServer(threading.Thread):
+    def __init__(self, mbtiles_manager, port: int = TILE_SERVER_PORT):
+        super().__init__(daemon=True)
+        OfflineTileHandler.mbtiles_manager = mbtiles_manager
+        self.port = port
+
+    def run(self):
+        server = HTTPServer(("127.0.0.1", self.port), OfflineTileHandler)
+        server.serve_forever()
+
+
+class VehicleMode(Enum):
+    MANUAL = 0
+    GUIDED = 4
+    AUTO = 10
+    LOITER = 5
+    HOLD = 16
+    RTB = 6
+
+
+class VehicleType(Enum):
+    IDA = "İDA"
+    IHA = "İHA"
+
+
+@dataclass
+class Waypoint:
+    seq: int
+    latitude: float
+    longitude: float
+    altitude: float = 5.0
+    delay_time: float = 0.0
+    accept_radius: float = 1.5
+    yaw_angle: float = 0.0
+    action: str = "WAYPOINT"
+
+
+@dataclass
+class Mission:
+    name: str
+    waypoints: List[Waypoint]
+    created_at: str = ""
+    description: str = ""
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "created_at": self.created_at or datetime.now().isoformat(),
+            "description": self.description,
+            "waypoints": [asdict(wp) for wp in self.waypoints],
+        }
+
+
+class MissionManager:
+    def __init__(self, missions_dir: str = "missions"):
+        self.missions_dir = Path(missions_dir)
+        self.missions_dir.mkdir(exist_ok=True)
+        self.missions: Dict[str, Mission] = {}
+        self._load_all_missions()
+
+    def _load_all_missions(self):
+        for mission_file in self.missions_dir.glob("*.json"):
+            try:
+                with open(mission_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                wps = [Waypoint(**wp) for wp in data.get("waypoints", [])]
+                self.missions[data["name"]] = Mission(
+                    name=data["name"],
+                    waypoints=wps,
+                    created_at=data.get("created_at", ""),
+                    description=data.get("description", ""),
+                )
+            except Exception:
+                pass
+
+    def create_mission(self, name: str) -> bool:
+        if name in self.missions:
+            return False
+        self.missions[name] = Mission(name=name, waypoints=[], created_at=datetime.now().isoformat())
+        return self.save_mission(name)
+
+    def export_csv(self, mission_name: str, csv_file: str) -> bool:
+        try:
+            if mission_name not in self.missions:
+                return False
+            with open(csv_file, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=["seq", "latitude", "longitude", "altitude", "delay_time", "accept_radius", "yaw_angle", "action"],
+                )
+                writer.writeheader()
+                for wp in self.missions[mission_name].waypoints:
+                    writer.writerow(asdict(wp))
+            return True
+        except Exception:
+            return False
+
+    def save_mission(self, mission_name: str) -> bool:
+        try:
+            if mission_name not in self.missions:
+                return False
+            json_file = self.missions_dir / f"{mission_name}.json"
+            with open(json_file, "w", encoding="utf-8") as f:
+                json.dump(self.missions[mission_name].to_dict(), f, indent=2, ensure_ascii=False)
+            return True
+        except Exception:
+            return False
+
+    def get_mission(self, mission_name: str) -> Optional[Mission]:
+        return self.missions.get(mission_name)
+
+    def list_missions(self) -> List[str]:
+        return list(self.missions.keys())
+
+
+class MapBridge(QObject):
+    waypoint_added = pyqtSignal(float, float, int)
+
+    @pyqtSlot(float, float, int)
+    def waypointAdded(self, lat: float, lon: float, idx: int):
+        self.waypoint_added.emit(lat, lon, idx)
+
+
+class VehicleThread(QThread):
+    data_signal = pyqtSignal(float, float, float, float, float, float, float, str, str, float, float)
+    health_signal = pyqtSignal(float, int, int, int)
+    log_signal = pyqtSignal(str)
+    connected_signal = pyqtSignal(bool)
+    statustext_signal = pyqtSignal(str)
+
+    def __init__(self, vehicle_type: VehicleType):
+        super().__init__()
+        self.vehicle_type = vehicle_type
+        self.master = None
+        self.is_running = False
+
+    def connect_vehicle(self, connection_string: str, baudrate: int = 57600):
+        try:
+            if connection_string.startswith("udp:") or connection_string.startswith("tcp:"):
+                self.master = mavutil.mavlink_connection(connection_string)
+            else:
+                self.master = mavutil.mavlink_connection(connection_string, baud=baudrate, timeout=1.0)
+
+            self.master.wait_heartbeat(timeout=5)
+            self.is_running = True
+            self.connected_signal.emit(True)
+            self.log_signal.emit(f"[{self.vehicle_type.value}] Bağlantı başarılı: {connection_string}")
+            self.start()
+        except Exception as e:
+            self.is_running = False
+            self.connected_signal.emit(False)
+            self.log_signal.emit(f"[{self.vehicle_type.value}] Bağlantı hatası: {e}")
+
+    def run(self):
+        lat = lon = speed = alt = roll = pitch = yaw = 0.0
+        yon_sp = hiz_sp = 0.0
+        mode = "---"
+        arm_status = "DISARM"
+        gps_fix = 0
+        uydu = 0
+        last_emit_time = 0.0
+
+        while self.is_running and self.master:
+            try:
+                msg = self.master.recv_match(
+                    type=["GLOBAL_POSITION_INT", "VFR_HUD", "ATTITUDE", "HEARTBEAT", "SYS_STATUS", "GPS_RAW_INT", "STATUSTEXT"],
+                    blocking=False,
+                    timeout=0.1,
+                )
+                if not msg:
+                    time.sleep(0.01)
+                    continue
+
+                mt = msg.get_type()
+                if mt == "GLOBAL_POSITION_INT":
+                    lat, lon = msg.lat / 1e7, msg.lon / 1e7
+                    alt = msg.relative_alt / 1000.0
+                elif mt == "VFR_HUD":
+                    speed = msg.groundspeed
+                elif mt == "ATTITUDE":
+                    roll, pitch, yaw = math.degrees(msg.roll), math.degrees(msg.pitch), math.degrees(msg.yaw)
+                    if yaw < 0:
+                        yaw += 360
+                elif mt == "HEARTBEAT":
+                    mode = mavutil.mode_string_v10(msg)
+                    arm_status = "ARM" if (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) else "DISARM"
+                elif mt == "GPS_RAW_INT":
+                    gps_fix, uydu = msg.fix_type, msg.satellites_visible
+                elif mt == "SYS_STATUS":
+                    vbat = msg.voltage_battery / 1000.0
+                    batt = msg.battery_remaining
+                    self.health_signal.emit(vbat, batt, gps_fix, uydu)
+                elif mt == "STATUSTEXT":
+                    try:
+                        text = msg.text.decode("utf-8", errors="ignore").upper()
+                    except Exception:
+                        text = str(getattr(msg, "text", "")).upper()
+                    if "COLOR" in text or "RENK" in text:
+                        self.statustext_signal.emit(text)
+
+                now = time.time()
+                if now - last_emit_time >= 0.1:
+                    self.data_signal.emit(lat, lon, speed, alt, roll, pitch, yaw, mode, arm_status, yon_sp, hiz_sp)
+                    last_emit_time = now
+
+            except Exception:
+                pass
+
+    def _send_servo(self, channel: int, pwm: int):
+        if not self.master:
+            return
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+            0,
+            channel, pwm, 0, 0, 0, 0, 0,
+        )
+
+    def trigger_kamikaze(self, pwm_value: int):
+        if not self.master:
+            return
+        try:
+            self._send_servo(KILL_SERVO_CHANNEL, pwm_value)
+            self.log_signal.emit(f"[{self.vehicle_type.value}] KAMIKAZE: CH{KILL_SERVO_CHANNEL} -> {pwm_value}")
+        except Exception as e:
+            self.log_signal.emit(f"[{self.vehicle_type.value}] Kamikaze hatası: {e}")
+
+    def kill_power(self):
+        if not self.master:
+            return
+        try:
+            self._send_servo(KILL_SERVO_CHANNEL, KILL_PWM)
+            self.log_signal.emit(f"[{self.vehicle_type.value}] 🛑 KILL: CH{KILL_SERVO_CHANNEL} -> {KILL_PWM}")
+        except Exception as e:
+            self.log_signal.emit(f"[{self.vehicle_type.value}] KILL hatası: {e}")
+
+    def send_waypoint_mission(self, waypoints: List[Waypoint]):
+        if not self.master:
+            return
+        if not waypoints:
+            self.log_signal.emit(f"[{self.vehicle_type.value}] Mission boş.")
+            return
+
+        try:
+            try:
+                self.master.mav.mission_clear_all_send(self.master.target_system, self.master.target_component)
+                time.sleep(0.2)
+            except:
+                pass
+
+            # SİHİR BURADA BAŞLIYOR: Gerçek nokta sayısı + 1 (Seq 0 HOME için)
+            mission_count = len(waypoints) + 1
+            self.master.mav.mission_count_send(self.master.target_system, self.master.target_component, mission_count)
+            time.sleep(0.2)
+
+            # Seq 0: Dummy HOME Gönderimi (Haritaya tıkladığın ilk noktayı ev olarak gösteriyoruz)
+            wp_home = waypoints[0]
+            self.master.mav.mission_item_int_send(
+                self.master.target_system,
+                self.master.target_component,
+                0,
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                0, 1,
+                wp_home.delay_time, wp_home.accept_radius, 0, wp_home.yaw_angle,
+                int(wp_home.latitude * 1e7),
+                int(wp_home.longitude * 1e7),
+                int(wp_home.altitude * 100)
+            )
+            time.sleep(0.15)
+
+            # Seq 1..N: Asıl seçtiğin noktaların gönderimi
+            for i, wp in enumerate(waypoints):
+                self.master.mav.mission_item_int_send(
+                    self.master.target_system,
+                    self.master.target_component,
+                    i + 1,  # Haritadaki 1. nokta Seq 1 oluyor!
+                    mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                    mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                    0, 1,
+                    wp.delay_time, wp.accept_radius, 0, wp.yaw_angle,
+                    int(wp.latitude * 1e7),
+                    int(wp.longitude * 1e7),
+                    int(wp.altitude * 100)
+                )
+                time.sleep(0.15)
+
+            self.log_signal.emit(f"[{self.vehicle_type.value}] Mission gönderildi ({len(waypoints)} nokta).")
+
+        except Exception as e:
+            self.log_signal.emit(f"[{self.vehicle_type.value}] Mission hata: {e}")
+
+    def arm_vehicle(self):
+        if self.master:
+            self.master.mav.command_long_send(
+                self.master.target_system, self.master.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+                1, 21196, 0, 0, 0, 0, 0
+            )
+
+    def disarm_vehicle(self):
+        if self.master:
+            self.master.mav.command_long_send(
+                self.master.target_system, self.master.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+                0, 0, 0, 0, 0, 0, 0
+            )
+
+    def set_mode(self, mode: VehicleMode):
+        if self.master:
+            self.master.mav.set_mode_send(
+                self.master.target_system,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                mode.value,
+            )
+
+    def disconnect(self):
+        self.is_running = False
+        if self.master:
+            try:
+                self.master.close()
+            except Exception:
+                pass
+        self.connected_signal.emit(False)
+
+
+class HorizonIndicator(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.setMinimumSize(180, 140)
+        self.setStyleSheet("background-color: #1e1e1e; border: 1px solid #333; border-radius: 4px;")
+
+    def update_attitude(self, roll: float, pitch: float):
+        self.roll = roll
+        self.pitch = pitch
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        painter.save()
+        painter.translate(w / 2, h / 2)
+        painter.rotate(-self.roll)
+        pitch_scale = 4.0
+        painter.translate(0, self.pitch * pitch_scale)
+
+        painter.fillRect(int(-w * 1.5), int(-h * 2), int(w * 3), int(h * 2), QColor(41, 128, 185))
+        painter.fillRect(int(-w * 1.5), 0, int(w * 3), int(h * 2), QColor(56, 142, 60))
+
+        painter.setPen(QPen(Qt.white, 2))
+        painter.drawLine(int(-w), 0, int(w), 0)
+        painter.restore()
+
+        painter.setPen(QPen(QColor(213, 0, 0), 2))
+        painter.drawLine(int(w / 2 - 25), int(h / 2), int(w / 2 - 8), int(h / 2))
+        painter.drawLine(int(w / 2 + 8), int(h / 2), int(w / 2 + 25), int(h / 2))
+        painter.drawLine(int(w / 2), int(h / 2 - 4), int(w / 2), int(h / 2 + 4))
+
+
+class YerKontrolIstasyonu(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("İDA YER KONTROL İSTASYONU - SAHA FINAL (DENEME FIX)")
+        self.setGeometry(30, 30, 1800, 1000)
+
+        self.log_dir = Path.cwd() / "logs"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_fp = None
+        self.log_csv = None
+        self.last_vbat = 0.0
+        self.open_new_log_file()
+
+        self.flush_timer = QTimer()
+        self.flush_timer.timeout.connect(self.auto_flush_log)
+        self.flush_timer.start(2000)
+
+        self.mbtiles_manager = MBTilesManager(MBTILES_FILE)
+        self.tile_server = None
+        if self.mbtiles_manager.has_offline_map:
+            self.tile_server = OfflineTileServer(self.mbtiles_manager, port=TILE_SERVER_PORT)
+            self.tile_server.start()
+
+        self.mission_manager = MissionManager()
+        self.ida_thread = VehicleThread(VehicleType.IDA)
+        self.iha_thread = VehicleThread(VehicleType.IHA)
+
+        self.current_waypoints: List[Waypoint] = []
+        self.follow_mode = True
+        self.kamikaze_active = False
+
+        self.last_map_js_ida = 0.0
+        self.last_map_js_iha = 0.0
+
+        self.speed_history = deque(maxlen=150)
+
+        self.apply_dark_style()
+        self.init_ui()
+
+        self.ida_thread.data_signal.connect(self.on_ida_telemetry)
+        self.ida_thread.health_signal.connect(self.on_ida_health)
+        self.ida_thread.log_signal.connect(self.log_message)
+        self.ida_thread.statustext_signal.connect(self.on_ida_statustext)
+
+        self.iha_thread.data_signal.connect(self.on_iha_telemetry)
+        self.iha_thread.log_signal.connect(self.log_message)
+        self.iha_thread.statustext_signal.connect(self.on_iha_statustext)
+
+        self.map_bridge.waypoint_added.connect(self.on_waypoint_added)
+
+        self.graph_timer = QTimer()
+        self.graph_timer.timeout.connect(self.update_graphs)
+        self.graph_timer.start(500)
+
+        self.log_message("Sistem Başlatıldı.")
+
+    def open_new_log_file(self):
+        if self.log_fp:
+            try:
+                self.log_fp.flush()
+                self.log_fp.close()
+            except Exception:
+                pass
+
+        log_name = self.log_dir / f"ida_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.log_fp = open(log_name, "w", newline="", encoding="utf-8")
+        self.log_csv = csv.writer(self.log_fp)
+        self.log_csv.writerow(["ts", "lat", "lon", "speed", "yaw", "mode", "arm", "vbat"])
+
+    def auto_flush_log(self):
+        if self.log_fp:
+            try:
+                self.log_fp.flush()
+                os.fsync(self.log_fp.fileno())
+            except Exception:
+                pass
+
+    def select_log_folder(self):
+        selected = QFileDialog.getExistingDirectory(self, "Log Klasörü Seç", str(self.log_dir))
+        if selected:
+            self.log_dir = Path(selected)
+            self.open_new_log_file()
+            self.lbl_log_path.setText(f"Log klasörü: {self.log_dir}")
+            self.log_message(f"Log klasörü: {self.log_dir}")
+
+    def apply_dark_style(self):
+        self.setStyleSheet("""
+            QWidget { background-color: #121212; color: #e0e0e0; font-family: Arial; font-size: 11px; }
+            QGroupBox { border: 1px solid #333; border-radius: 4px; margin-top: 8px; padding-top: 8px; }
+            QGroupBox::title { color: #00e5ff; font-weight: bold; font-size: 12px; }
+            QPushButton { background-color: #2d2d30; border: 1px solid #444; padding: 5px; border-radius: 3px; color: white; font-weight: bold; }
+            QPushButton:hover { background-color: #3e3e42; border: 1px solid #00e5ff; }
+            QComboBox { background-color: #252526; border: 1px solid #3e3e42; border-radius: 3px; padding: 4px; color: white; }
+            QTextEdit { background-color: #000; color: #00e676; font-family: monospace; font-size: 10px; border: 1px solid #333; }
+        """)
+
+    def init_ui(self):
+        main_layout = QHBoxLayout()
+
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+
+        ida_conn_group = QGroupBox("İDA Bağlantısı")
+        ida_conn_layout = QFormLayout()
+        self.ida_port_combo = QComboBox()
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.ida_port_combo.addItems(["udp:127.0.0.1:14550"] + ports)
+        self.ida_baud_combo = QComboBox()
+        self.ida_baud_combo.addItems(["57600", "115200"])
+
+        btn_ida_conn = QPushButton("Bağlan")
+        btn_ida_conn.clicked.connect(
+            lambda: self.ida_thread.connect_vehicle(self.ida_port_combo.currentText(), int(self.ida_baud_combo.currentText()))
+        )
+        ida_conn_layout.addRow("Port:", self.ida_port_combo)
+        ida_conn_layout.addRow("Baud:", self.ida_baud_combo)
+        ida_conn_layout.addRow("", btn_ida_conn)
+        ida_conn_group.setLayout(ida_conn_layout)
+        left_layout.addWidget(ida_conn_group)
+
+        ida_telem_group = QGroupBox("İDA Telemetri")
+        ida_telem_layout = QVBoxLayout()
+        self.lbl_ida_mode = QLabel("Mod: ---")
+        self.lbl_ida_arm = QLabel("Durum: ---")
+        self.lbl_ida_speed = QLabel("Hız: ---")
+        self.lbl_ida_battery = QLabel("Batarya: ---")
+        ida_telem_layout.addWidget(self.lbl_ida_mode)
+        ida_telem_layout.addWidget(self.lbl_ida_arm)
+        ida_telem_layout.addWidget(self.lbl_ida_speed)
+        ida_telem_layout.addWidget(self.lbl_ida_battery)
+        ida_telem_group.setLayout(ida_telem_layout)
+        left_layout.addWidget(ida_telem_group)
+
+        ida_motor_group = QGroupBox("İDA Kontrol")
+        ida_motor_layout = QGridLayout()
+
+        btn_ida_arm = QPushButton("ARM")
+        btn_ida_arm.clicked.connect(self.ida_thread.arm_vehicle)
+
+        btn_ida_disarm = QPushButton("DISARM")
+        btn_ida_disarm.clicked.connect(self.ida_thread.disarm_vehicle)
+
+        btn_ida_auto = QPushButton("AUTO")
+        btn_ida_auto.clicked.connect(lambda: self.ida_thread.set_mode(VehicleMode.AUTO))
+
+        btn_ida_manual = QPushButton("MANUAL (DUR)")
+        btn_ida_manual.setStyleSheet("background:#e65100;color:white;")
+        btn_ida_manual.clicked.connect(lambda: self.ida_thread.set_mode(VehicleMode.MANUAL))
+
+        btn_kill = QPushButton("🛑 ACİL KILL")
+        btn_kill.setStyleSheet("background:#b71c1c;color:white;")
+        btn_kill.clicked.connect(self.confirm_kill)
+
+        ida_motor_layout.addWidget(btn_ida_arm, 0, 0)
+        ida_motor_layout.addWidget(btn_ida_disarm, 0, 1)
+        ida_motor_layout.addWidget(btn_ida_auto, 1, 0)
+        ida_motor_layout.addWidget(btn_ida_manual, 1, 1)
+        ida_motor_layout.addWidget(btn_kill, 2, 0, 1, 2)
+
+        btn_clear = QPushButton("🧹 HARİTAYI TEMİZLE")
+        btn_clear.clicked.connect(self.clear_mission_everywhere)
+        ida_motor_layout.addWidget(btn_clear, 3, 0, 1, 2)
+
+        btn_follow = QPushButton("🎯 FOLLOW: ON/OFF")
+        btn_follow.clicked.connect(self.toggle_follow)
+        ida_motor_layout.addWidget(btn_follow, 4, 0, 1, 2)
+
+        ida_motor_group.setLayout(ida_motor_layout)
+        left_layout.addWidget(ida_motor_group)
+
+        self.horizon_ida = HorizonIndicator()
+        left_layout.addWidget(self.horizon_ida)
+        left_layout.addStretch()
+
+        center_widget = QWidget()
+        center_layout = QVBoxLayout(center_widget)
+
+        self.map_view = QWebEngineView()
+        leaflet_js_path = Path.cwd() / "leaflet" / "leaflet.js"
+        leaflet_css_path = Path.cwd() / "leaflet" / "leaflet.css"
+
+        if not (leaflet_js_path.exists() and leaflet_css_path.exists()):
+            self.map_view.setHtml(
+                "<html><body style='background:#121212;color:#ff5252;font-family:Arial;padding:20px;'>"
+                "<h2>Leaflet dosyaları eksik</h2><p>leaflet/leaflet.js ve leaflet/leaflet.css gerekli.</p></body></html>"
+            )
+        else:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            base_url = QUrl.fromLocalFile(current_dir + os.sep)
+
+            html = MAP_HTML_TEMPLATE.format(
+                tile_url=f"http://127.0.0.1:{TILE_SERVER_PORT}/tile/{{z}}/{{x}}/{{y}}",
+                enable_tiles="true" if self.mbtiles_manager.has_offline_map else "false",
+                max_wps=MAX_WAYPOINTS,
+            )
+            self.map_view.setHtml(html, base_url)
+
+        self.map_bridge = MapBridge()
+        self.map_channel = QWebChannel()
+        self.map_channel.registerObject("bridge", self.map_bridge)
+        self.map_view.page().setWebChannel(self.map_channel)
+        center_layout.addWidget(self.map_view, 3)
+
+        mission_group = QGroupBox("Görev Yönetimi")
+        mission_layout = QVBoxLayout()
+
+        self.mission_combo = QComboBox()
+        self._refresh_mission_list()
+        mission_layout.addWidget(self.mission_combo)
+
+        btn_row = QHBoxLayout()
+        btn_new = QPushButton("Yeni")
+        btn_new.clicked.connect(self.create_new_mission)
+        btn_load = QPushButton("Yükle")
+        btn_load.clicked.connect(self.load_mission_to_map)
+        btn_export = QPushButton("Aktar")
+        btn_export.clicked.connect(self.export_csv_mission)
+        btn_row.addWidget(btn_new)
+        btn_row.addWidget(btn_load)
+        btn_row.addWidget(btn_export)
+        mission_layout.addLayout(btn_row)
+
+        self.lbl_wp_count = QLabel(f"Noktalar: 0/{MAX_WAYPOINTS}")
+        mission_layout.addWidget(self.lbl_wp_count)
+
+        btn_send = QPushButton("GÖREVİ GÖNDER")
+        btn_send.clicked.connect(self.send_mission_to_ida)
+        mission_layout.addWidget(btn_send)
+
+        mission_group.setLayout(mission_layout)
+        center_layout.addWidget(mission_group, 1)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+
+        pg.setConfigOption("background", "#121212")
+        pg.setConfigOption("foreground", "#e0e0e0")
+        self.plot_speed_widget = pg.PlotWidget(title="İDA Hızı (m/s)")
+        self.curve_speed = self.plot_speed_widget.plot(pen=pg.mkPen("#00e5ff", width=2))
+        right_layout.addWidget(self.plot_speed_widget)
+
+        iha_conn_group = QGroupBox("İHA Bağlantısı")
+        iha_conn_layout = QFormLayout()
+        self.iha_port_combo = QComboBox()
+        self.iha_port_combo.addItems(["udp:127.0.0.1:14552"] + ports)
+        btn_iha_conn = QPushButton("Bağlan")
+        btn_iha_conn.clicked.connect(lambda: self.iha_thread.connect_vehicle(self.iha_port_combo.currentText()))
+        iha_conn_layout.addRow("Port:", self.iha_port_combo)
+        iha_conn_layout.addRow("", btn_iha_conn)
+        iha_conn_group.setLayout(iha_conn_layout)
+        right_layout.addWidget(iha_conn_group)
+
+        btn_log_folder = QPushButton("📂 Log Klasörü Seç")
+        btn_log_folder.clicked.connect(self.select_log_folder)
+        right_layout.addWidget(btn_log_folder)
+
+        self.lbl_log_path = QLabel(f"Log klasörü: {self.log_dir}")
+        self.lbl_log_path.setStyleSheet("color:#b0b0b0;")
+        right_layout.addWidget(self.lbl_log_path)
+
+        self.log_text = QTextEdit()
+        self.log_text.setMaximumHeight(160)
+        right_layout.addWidget(self.log_text)
+
+        right_layout.addStretch()
+
+        splitter = QSplitter(Qt.Horizontal)
+        scroll_left = QScrollArea()
+        scroll_left.setWidgetResizable(True)
+        scroll_left.setWidget(left_widget)
+
+        scroll_right = QScrollArea()
+        scroll_right.setWidgetResizable(True)
+        scroll_right.setWidget(right_widget)
+
+        splitter.addWidget(scroll_left)
+        splitter.addWidget(center_widget)
+        splitter.addWidget(scroll_right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 1)
+
+        main_layout.addWidget(splitter)
+        self.setLayout(main_layout)
+
+    def toggle_follow(self):
+        self.follow_mode = not self.follow_mode
+        self.map_view.page().runJavaScript(f"window.setFollowMode({str(self.follow_mode).lower()});")
+        self.log_message(f"FOLLOW: {'ON' if self.follow_mode else 'OFF'}")
+
+    def clear_mission_everywhere(self):
+        self.current_waypoints.clear()
+        self.lbl_wp_count.setText(f"Noktalar: 0/{MAX_WAYPOINTS}")
+        self.map_view.page().runJavaScript("window.suppressBridge=true; window.clearMission();")
+        QTimer.singleShot(300, lambda: self.map_view.page().runJavaScript("window.suppressBridge=false;"))
+        self.log_message("Mission temizlendi.")
+
+    def confirm_kill(self):
+        ret = QMessageBox.question(
+            self,
+            "ACİL KILL",
+            f"Araç gücü kesilsin mi?\nCH{KILL_SERVO_CHANNEL} -> PWM {KILL_PWM}",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ret == QMessageBox.Yes:
+            self.ida_thread.kill_power()
+
+    def update_graphs(self):
+        if self.speed_history:
+            self.curve_speed.setData(list(range(len(self.speed_history))), list(self.speed_history))
+
+    @pyqtSlot(float, float, float, float, float, float, float, str, str, float, float)
+    def on_ida_telemetry(self, lat, lon, speed, alt, roll, pitch, yaw, mode, arm, yon_sp, hiz_sp):
+        self.lbl_ida_mode.setText(f"Mod: {mode}")
+        self.lbl_ida_arm.setText(f"Durum: {arm}")
+        self.lbl_ida_speed.setText(f"Hız: {speed:.1f} m/s")
+        self.horizon_ida.update_attitude(roll, pitch)
+
+        self.speed_history.append(speed)
+
+        if self.log_csv:
+            self.log_csv.writerow([time.time(), lat, lon, speed, yaw, mode, arm, self.last_vbat])
+
+        now = time.time()
+        if now - self.last_map_js_ida >= 0.2:
+            self.map_view.page().runJavaScript(
+                f"window.updateIdaPosition({lat}, {lon}, {yaw}, {speed}, '{mode}');"
+            )
+            self.last_map_js_ida = now
+
+    @pyqtSlot(float, int, int, int)
+    def on_ida_health(self, voltage, battery, gps_fix, satellites):
+        self.last_vbat = voltage
+        self.lbl_ida_battery.setText(f"Batarya: {battery}% ({voltage:.1f}V) | GPS:{gps_fix} SAT:{satellites}")
+
+    @pyqtSlot(float, float, float, float, float, float, float, str, str, float, float)
+    def on_iha_telemetry(self, lat, lon, speed, alt, roll, pitch, yaw, mode, arm, yon_sp, hiz_sp):
+        now = time.time()
+        if now - self.last_map_js_iha >= 0.2:
+            self.map_view.page().runJavaScript(
+                f"window.updateIhaPosition({lat}, {lon}, {yaw}, {alt}, '{mode}');"
+            )
+            self.last_map_js_iha = now
+
+    @pyqtSlot(str)
+    def on_iha_statustext(self, text: str):
+        self.log_message(f"[İHA] {text}")
+
+    @pyqtSlot(str)
+    def on_ida_statustext(self, text: str):
+        self.log_message(f"[İDA] {text}")
+
+    @pyqtSlot(float, float, int)
+    def on_waypoint_added(self, lat: float, lon: float, idx: int):
+        if len(self.current_waypoints) >= MAX_WAYPOINTS:
+            return
+        self.current_waypoints.append(Waypoint(seq=idx, latitude=lat, longitude=lon))
+        self.lbl_wp_count.setText(f"Noktalar: {len(self.current_waypoints)}/{MAX_WAYPOINTS}")
+
+    def create_new_mission(self):
+        name, ok = QInputDialog.getText(self, "Mission", "Adı:")
+        if ok and name:
+            if self.mission_manager.create_mission(name):
+                self._refresh_mission_list()
+                self.log_message(f"Mission oluşturuldu: {name}")
+            else:
+                QMessageBox.warning(self, "Hata", "Bu mission adı zaten var.")
+
+    def load_mission_to_map(self):
+        m = self.mission_manager.get_mission(self.mission_combo.currentText())
+        if not m:
+            return
+
+        self.current_waypoints.clear()
+        self.map_view.page().runJavaScript("window.suppressBridge=true; window.clearMission();")
+
+        for wp in m.waypoints[:MAX_WAYPOINTS]:
+            self.current_waypoints.append(wp)
+            self.map_view.page().runJavaScript(f"window.addMissionWaypoint({wp.latitude}, {wp.longitude});")
+
+        QTimer.singleShot(400, lambda: self.map_view.page().runJavaScript("window.suppressBridge=false;"))
+
+        self.lbl_wp_count.setText(f"Noktalar: {len(self.current_waypoints)}/{MAX_WAYPOINTS}")
+        self.log_message(f"Görev yüklendi: {m.name}")
+
+    def export_csv_mission(self):
+        name = self.mission_combo.currentText()
+        if name:
+            file, _ = QFileDialog.getSaveFileName(self, "Kaydet", "", "CSV (*.csv)")
+            if file:
+                if self.mission_manager.export_csv(name, file):
+                    self.log_message(f"CSV export: {file}")
+                else:
+                    QMessageBox.warning(self, "Hata", "Export başarısız.")
+
+    def send_mission_to_ida(self):
+        if not self.current_waypoints:
+            QMessageBox.warning(self, "Hata", "Waypoint yok.")
+            return
+        self.ida_thread.send_waypoint_mission(self.current_waypoints)
+
+    def _refresh_mission_list(self):
+        self.mission_combo.clear()
+        self.mission_combo.addItems(self.mission_manager.list_missions())
+
+    def log_message(self, msg: str):
+        self.log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+
+    def closeEvent(self, event):
+        self.flush_timer.stop()
+        self.ida_thread.disconnect()
+        self.iha_thread.disconnect()
+        try:
+            if self.log_fp:
+                self.log_fp.flush()
+                self.log_fp.close()
+        except Exception:
+            pass
+        if self.mbtiles_manager:
+            self.mbtiles_manager.close()
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    w = YerKontrolIstasyonu()
+    w.show()
+    sys.exit(app.exec_())
+
+    def arm_vehicle(self):
+        if self.master:
+            self.master.mav.command_long_send(
+                self.master.target_system, self.master.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+                1, 21196, 0, 0, 0, 0, 0
+            )
+
+    def disarm_vehicle(self):
+        if self.master:
+            self.master.mav.command_long_send(
+                self.master.target_system, self.master.target_component,
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+                0, 0, 0, 0, 0, 0, 0
+            )
+
+    def set_mode(self, mode: VehicleMode):
+        if self.master:
+            self.master.mav.set_mode_send(
+                self.master.target_system,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                mode.value,
+            )
+
+    def disconnect(self):
+        self.is_running = False
+        if self.master:
+            try:
+                self.master.close()
+            except Exception:
+                pass
+        self.connected_signal.emit(False)
+
+
+class HorizonIndicator(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.setMinimumSize(180, 140)
+        self.setStyleSheet("background-color: #1e1e1e; border: 1px solid #333; border-radius: 4px;")
+
+    def update_attitude(self, roll: float, pitch: float):
+        self.roll = roll
+        self.pitch = pitch
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+
+        painter.save()
+        painter.translate(w / 2, h / 2)
+        painter.rotate(-self.roll)
+        pitch_scale = 4.0
+        painter.translate(0, self.pitch * pitch_scale)
+
+        painter.fillRect(int(-w * 1.5), int(-h * 2), int(w * 3), int(h * 2), QColor(41, 128, 185))
+        painter.fillRect(int(-w * 1.5), 0, int(w * 3), int(h * 2), QColor(56, 142, 60))
+
+        painter.setPen(QPen(Qt.white, 2))
+        painter.drawLine(int(-w), 0, int(w), 0)
+        painter.restore()
+
+        painter.setPen(QPen(QColor(213, 0, 0), 2))
+        painter.drawLine(int(w / 2 - 25), int(h / 2), int(w / 2 - 8), int(h / 2))
+        painter.drawLine(int(w / 2 + 8), int(h / 2), int(w / 2 + 25), int(h / 2))
+        painter.drawLine(int(w / 2), int(h / 2 - 4), int(w / 2), int(h / 2 + 4))
+
+
+class YerKontrolIstasyonu(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("İDA YER KONTROL İSTASYONU - SAHA FINAL (DENEME FIX)")
+        self.setGeometry(30, 30, 1800, 1000)
+
+        self.log_dir = Path.cwd() / "logs"
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_fp = None
+        self.log_csv = None
+        self.last_vbat = 0.0
+        self.open_new_log_file()
+
+        self.flush_timer = QTimer()
+        self.flush_timer.timeout.connect(self.auto_flush_log)
+        self.flush_timer.start(2000)
+
+        self.mbtiles_manager = MBTilesManager(MBTILES_FILE)
+        self.tile_server = None
+        if self.mbtiles_manager.has_offline_map:
+            self.tile_server = OfflineTileServer(self.mbtiles_manager, port=TILE_SERVER_PORT)
+            self.tile_server.start()
+
+        self.mission_manager = MissionManager()
+        self.ida_thread = VehicleThread(VehicleType.IDA)
+        self.iha_thread = VehicleThread(VehicleType.IHA)
+
+        self.current_waypoints: List[Waypoint] = []
+        self.follow_mode = True
+        self.kamikaze_active = False
+
+        self.last_map_js_ida = 0.0
+        self.last_map_js_iha = 0.0
+
+        self.speed_history = deque(maxlen=150)
+
+        self.apply_dark_style()
+        self.init_ui()
+
+        self.ida_thread.data_signal.connect(self.on_ida_telemetry)
+        self.ida_thread.health_signal.connect(self.on_ida_health)
+        self.ida_thread.log_signal.connect(self.log_message)
+        self.ida_thread.statustext_signal.connect(self.on_ida_statustext)
+
+        self.iha_thread.data_signal.connect(self.on_iha_telemetry)
+        self.iha_thread.log_signal.connect(self.log_message)
+        self.iha_thread.statustext_signal.connect(self.on_iha_statustext)
+
+        self.map_bridge.waypoint_added.connect(self.on_waypoint_added)
+
+        self.graph_timer = QTimer()
+        self.graph_timer.timeout.connect(self.update_graphs)
+        self.graph_timer.start(500)
+
+        self.log_message("Sistem Başlatıldı.")
+
+    def open_new_log_file(self):
+        if self.log_fp:
+            try:
+                self.log_fp.flush()
+                self.log_fp.close()
+            except Exception:
+                pass
+
+        log_name = self.log_dir / f"ida_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.log_fp = open(log_name, "w", newline="", encoding="utf-8")
+        self.log_csv = csv.writer(self.log_fp)
+        self.log_csv.writerow(["ts", "lat", "lon", "speed", "yaw", "mode", "arm", "vbat"])
+
+    def auto_flush_log(self):
+        if self.log_fp:
+            try:
+                self.log_fp.flush()
+                os.fsync(self.log_fp.fileno())
+            except Exception:
+                pass
+
+    def select_log_folder(self):
+        selected = QFileDialog.getExistingDirectory(self, "Log Klasörü Seç", str(self.log_dir))
+        if selected:
+            self.log_dir = Path(selected)
+            self.open_new_log_file()
+            self.lbl_log_path.setText(f"Log klasörü: {self.log_dir}")
+            self.log_message(f"Log klasörü: {self.log_dir}")
+
+    def apply_dark_style(self):
+        self.setStyleSheet("""
+            QWidget { background-color: #121212; color: #e0e0e0; font-family: Arial; font-size: 11px; }
+            QGroupBox { border: 1px solid #333; border-radius: 4px; margin-top: 8px; padding-top: 8px; }
+            QGroupBox::title { color: #00e5ff; font-weight: bold; font-size: 12px; }
+            QPushButton { background-color: #2d2d30; border: 1px solid #444; padding: 5px; border-radius: 3px; color: white; font-weight: bold; }
+            QPushButton:hover { background-color: #3e3e42; border: 1px solid #00e5ff; }
+            QComboBox { background-color: #252526; border: 1px solid #3e3e42; border-radius: 3px; padding: 4px; color: white; }
+            QTextEdit { background-color: #000; color: #00e676; font-family: monospace; font-size: 10px; border: 1px solid #333; }
+        """)
+
+    def init_ui(self):
+        main_layout = QHBoxLayout()
+
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+
+        ida_conn_group = QGroupBox("İDA Bağlantısı")
+        ida_conn_layout = QFormLayout()
+        self.ida_port_combo = QComboBox()
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        self.ida_port_combo.addItems(["udp:127.0.0.1:14550"] + ports)
+        self.ida_baud_combo = QComboBox()
+        self.ida_baud_combo.addItems(["57600", "115200"])
+
+        btn_ida_conn = QPushButton("Bağlan")
+        btn_ida_conn.clicked.connect(
+            lambda: self.ida_thread.connect_vehicle(self.ida_port_combo.currentText(), int(self.ida_baud_combo.currentText()))
+        )
+        ida_conn_layout.addRow("Port:", self.ida_port_combo)
+        ida_conn_layout.addRow("Baud:", self.ida_baud_combo)
+        ida_conn_layout.addRow("", btn_ida_conn)
+        ida_conn_group.setLayout(ida_conn_layout)
+        left_layout.addWidget(ida_conn_group)
+
+        ida_telem_group = QGroupBox("İDA Telemetri")
+        ida_telem_layout = QVBoxLayout()
+        self.lbl_ida_mode = QLabel("Mod: ---")
+        self.lbl_ida_arm = QLabel("Durum: ---")
+        self.lbl_ida_speed = QLabel("Hız: ---")
+        self.lbl_ida_battery = QLabel("Batarya: ---")
+        ida_telem_layout.addWidget(self.lbl_ida_mode)
+        ida_telem_layout.addWidget(self.lbl_ida_arm)
+        ida_telem_layout.addWidget(self.lbl_ida_speed)
+        ida_telem_layout.addWidget(self.lbl_ida_battery)
+        ida_telem_group.setLayout(ida_telem_layout)
+        left_layout.addWidget(ida_telem_group)
+
+        ida_motor_group = QGroupBox("İDA Kontrol")
+        ida_motor_layout = QGridLayout()
+
+        btn_ida_arm = QPushButton("ARM")
+        btn_ida_arm.clicked.connect(self.ida_thread.arm_vehicle)
+
+        btn_ida_disarm = QPushButton("DISARM")
+        btn_ida_disarm.clicked.connect(self.ida_thread.disarm_vehicle)
+
+        btn_ida_auto = QPushButton("AUTO")
+        btn_ida_auto.clicked.connect(lambda: self.ida_thread.set_mode(VehicleMode.AUTO))
+
+        btn_ida_manual = QPushButton("MANUAL (DUR)")
+        btn_ida_manual.setStyleSheet("background:#e65100;color:white;")
+        btn_ida_manual.clicked.connect(lambda: self.ida_thread.set_mode(VehicleMode.MANUAL))
+
+        btn_kill = QPushButton("🛑 ACİL KILL")
+        btn_kill.setStyleSheet("background:#b71c1c;color:white;")
+        btn_kill.clicked.connect(self.confirm_kill)
+
+        ida_motor_layout.addWidget(btn_ida_arm, 0, 0)
+        ida_motor_layout.addWidget(btn_ida_disarm, 0, 1)
+        ida_motor_layout.addWidget(btn_ida_auto, 1, 0)
+        ida_motor_layout.addWidget(btn_ida_manual, 1, 1)
+        ida_motor_layout.addWidget(btn_kill, 2, 0, 1, 2)
+
+        btn_clear = QPushButton("🧹 HARİTAYI TEMİZLE")
+        btn_clear.clicked.connect(self.clear_mission_everywhere)
+        ida_motor_layout.addWidget(btn_clear, 3, 0, 1, 2)
+
+        btn_follow = QPushButton("🎯 FOLLOW: ON/OFF")
+        btn_follow.clicked.connect(self.toggle_follow)
+        ida_motor_layout.addWidget(btn_follow, 4, 0, 1, 2)
+
+        ida_motor_group.setLayout(ida_motor_layout)
+        left_layout.addWidget(ida_motor_group)
+
+        self.horizon_ida = HorizonIndicator()
+        left_layout.addWidget(self.horizon_ida)
+        left_layout.addStretch()
+
+        center_widget = QWidget()
+        center_layout = QVBoxLayout(center_widget)
+
+        self.map_view = QWebEngineView()
+        leaflet_js_path = Path.cwd() / "leaflet" / "leaflet.js"
+        leaflet_css_path = Path.cwd() / "leaflet" / "leaflet.css"
+
+        if not (leaflet_js_path.exists() and leaflet_css_path.exists()):
+            self.map_view.setHtml(
+                "<html><body style='background:#121212;color:#ff5252;font-family:Arial;padding:20px;'>"
+                "<h2>Leaflet dosyaları eksik</h2><p>leaflet/leaflet.js ve leaflet/leaflet.css gerekli.</p></body></html>"
+            )
+        else:
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            base_url = QUrl.fromLocalFile(current_dir + os.sep)
+
+            html = MAP_HTML_TEMPLATE.format(
+                tile_url=f"http://127.0.0.1:{TILE_SERVER_PORT}/tile/{{z}}/{{x}}/{{y}}",
+                enable_tiles="true" if self.mbtiles_manager.has_offline_map else "false",
+                max_wps=MAX_WAYPOINTS,
+            )
+            self.map_view.setHtml(html, base_url)
+
+        self.map_bridge = MapBridge()
+        self.map_channel = QWebChannel()
+        self.map_channel.registerObject("bridge", self.map_bridge)
+        self.map_view.page().setWebChannel(self.map_channel)
+        center_layout.addWidget(self.map_view, 3)
+
+        mission_group = QGroupBox("Görev Yönetimi")
+        mission_layout = QVBoxLayout()
+
+        self.mission_combo = QComboBox()
+        self._refresh_mission_list()
+        mission_layout.addWidget(self.mission_combo)
+
+        btn_row = QHBoxLayout()
+        btn_new = QPushButton("Yeni")
+        btn_new.clicked.connect(self.create_new_mission)
+        btn_load = QPushButton("Yükle")
+        btn_load.clicked.connect(self.load_mission_to_map)
+        btn_export = QPushButton("Aktar")
+        btn_export.clicked.connect(self.export_csv_mission)
+        btn_row.addWidget(btn_new)
+        btn_row.addWidget(btn_load)
+        btn_row.addWidget(btn_export)
+        mission_layout.addLayout(btn_row)
+
+        self.lbl_wp_count = QLabel(f"Noktalar: 0/{MAX_WAYPOINTS}")
+        mission_layout.addWidget(self.lbl_wp_count)
+
+        btn_send = QPushButton("GÖREVİ GÖNDER")
+        btn_send.clicked.connect(self.send_mission_to_ida)
+        mission_layout.addWidget(btn_send)
+
+        mission_group.setLayout(mission_layout)
+        center_layout.addWidget(mission_group, 1)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+
+        pg.setConfigOption("background", "#121212")
+        pg.setConfigOption("foreground", "#e0e0e0")
+        self.plot_speed_widget = pg.PlotWidget(title="İDA Hızı (m/s)")
+        self.curve_speed = self.plot_speed_widget.plot(pen=pg.mkPen("#00e5ff", width=2))
+        right_layout.addWidget(self.plot_speed_widget)
+
+        iha_conn_group = QGroupBox("İHA Bağlantısı")
+        iha_conn_layout = QFormLayout()
+        self.iha_port_combo = QComboBox()
+        self.iha_port_combo.addItems(["udp:127.0.0.1:14552"] + ports)
+        btn_iha_conn = QPushButton("Bağlan")
+        btn_iha_conn.clicked.connect(lambda: self.iha_thread.connect_vehicle(self.iha_port_combo.currentText()))
+        iha_conn_layout.addRow("Port:", self.iha_port_combo)
+        iha_conn_layout.addRow("", btn_iha_conn)
+        iha_conn_group.setLayout(iha_conn_layout)
+        right_layout.addWidget(iha_conn_group)
+
+        btn_log_folder = QPushButton("📂 Log Klasörü Seç")
+        btn_log_folder.clicked.connect(self.select_log_folder)
+        right_layout.addWidget(btn_log_folder)
+
+        self.lbl_log_path = QLabel(f"Log klasörü: {self.log_dir}")
+        self.lbl_log_path.setStyleSheet("color:#b0b0b0;")
+        right_layout.addWidget(self.lbl_log_path)
+
+        self.log_text = QTextEdit()
+        self.log_text.setMaximumHeight(160)
+        right_layout.addWidget(self.log_text)
+
+        right_layout.addStretch()
+
+        splitter = QSplitter(Qt.Horizontal)
+        scroll_left = QScrollArea()
+        scroll_left.setWidgetResizable(True)
+        scroll_left.setWidget(left_widget)
+
+        scroll_right = QScrollArea()
+        scroll_right.setWidgetResizable(True)
+        scroll_right.setWidget(right_widget)
+
+        splitter.addWidget(scroll_left)
+        splitter.addWidget(center_widget)
+        splitter.addWidget(scroll_right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 1)
+
+        main_layout.addWidget(splitter)
+        self.setLayout(main_layout)
+
+    def toggle_follow(self):
+        self.follow_mode = not self.follow_mode
+        self.map_view.page().runJavaScript(f"window.setFollowMode({str(self.follow_mode).lower()});")
+        self.log_message(f"FOLLOW: {'ON' if self.follow_mode else 'OFF'}")
+
+    def clear_mission_everywhere(self):
+        self.current_waypoints.clear()
+        self.lbl_wp_count.setText(f"Noktalar: 0/{MAX_WAYPOINTS}")
+        self.map_view.page().runJavaScript("window.suppressBridge=true; window.clearMission();")
+        QTimer.singleShot(300, lambda: self.map_view.page().runJavaScript("window.suppressBridge=false;"))
+        self.log_message("Mission temizlendi.")
+
+    def confirm_kill(self):
+        ret = QMessageBox.question(
+            self,
+            "ACİL KILL",
+            f"Araç gücü kesilsin mi?\nCH{KILL_SERVO_CHANNEL} -> PWM {KILL_PWM}",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ret == QMessageBox.Yes:
+            self.ida_thread.kill_power()
+
+    def update_graphs(self):
+        if self.speed_history:
+            self.curve_speed.setData(list(range(len(self.speed_history))), list(self.speed_history))
+
+    @pyqtSlot(float, float, float, float, float, float, float, str, str, float, float)
+    def on_ida_telemetry(self, lat, lon, speed, alt, roll, pitch, yaw, mode, arm, yon_sp, hiz_sp):
+        self.lbl_ida_mode.setText(f"Mod: {mode}")
+        self.lbl_ida_arm.setText(f"Durum: {arm}")
+        self.lbl_ida_speed.setText(f"Hız: {speed:.1f} m/s")
+        self.horizon_ida.update_attitude(roll, pitch)
+
+        self.speed_history.append(speed)
+
+        if self.log_csv:
+            self.log_csv.writerow([time.time(), lat, lon, speed, yaw, mode, arm, self.last_vbat])
+
+        now = time.time()
+        if now - self.last_map_js_ida >= 0.2:
+            self.map_view.page().runJavaScript(
+                f"window.updateIdaPosition({lat}, {lon}, {yaw}, {speed}, '{mode}');"
+            )
+            self.last_map_js_ida = now
+
+    @pyqtSlot(float, int, int, int)
+    def on_ida_health(self, voltage, battery, gps_fix, satellites):
+        self.last_vbat = voltage
+        self.lbl_ida_battery.setText(f"Batarya: {battery}% ({voltage:.1f}V) | GPS:{gps_fix} SAT:{satellites}")
+
+    @pyqtSlot(float, float, float, float, float, float, float, str, str, float, float)
+    def on_iha_telemetry(self, lat, lon, speed, alt, roll, pitch, yaw, mode, arm, yon_sp, hiz_sp):
+        now = time.time()
+        if now - self.last_map_js_iha >= 0.2:
+            self.map_view.page().runJavaScript(
+                f"window.updateIhaPosition({lat}, {lon}, {yaw}, {alt}, '{mode}');"
+            )
+            self.last_map_js_iha = now
+
+    @pyqtSlot(str)
+    def on_iha_statustext(self, text: str):
+        self.log_message(f"[İHA] {text}")
+
+    @pyqtSlot(str)
+    def on_ida_statustext(self, text: str):
+        self.log_message(f"[İDA] {text}")
+
+    @pyqtSlot(float, float, int)
+    def on_waypoint_added(self, lat: float, lon: float, idx: int):
+        if len(self.current_waypoints) >= MAX_WAYPOINTS:
+            return
+        self.current_waypoints.append(Waypoint(seq=idx, latitude=lat, longitude=lon))
+        self.lbl_wp_count.setText(f"Noktalar: {len(self.current_waypoints)}/{MAX_WAYPOINTS}")
+
+    def create_new_mission(self):
+        name, ok = QInputDialog.getText(self, "Mission", "Adı:")
+        if ok and name:
+            if self.mission_manager.create_mission(name):
+                self._refresh_mission_list()
+                self.log_message(f"Mission oluşturuldu: {name}")
+            else:
+                QMessageBox.warning(self, "Hata", "Bu mission adı zaten var.")
+
+    def load_mission_to_map(self):
+        m = self.mission_manager.get_mission(self.mission_combo.currentText())
+        if not m:
+            return
+
+        self.current_waypoints.clear()
+        self.map_view.page().runJavaScript("window.suppressBridge=true; window.clearMission();")
+
+        for wp in m.waypoints[:MAX_WAYPOINTS]:
+            self.current_waypoints.append(wp)
+            self.map_view.page().runJavaScript(f"window.addMissionWaypoint({wp.latitude}, {wp.longitude});")
+
+        QTimer.singleShot(400, lambda: self.map_view.page().runJavaScript("window.suppressBridge=false;"))
+
+        self.lbl_wp_count.setText(f"Noktalar: {len(self.current_waypoints)}/{MAX_WAYPOINTS}")
+        self.log_message(f"Görev yüklendi: {m.name}")
+
+    def export_csv_mission(self):
+        name = self.mission_combo.currentText()
+        if name:
+            file, _ = QFileDialog.getSaveFileName(self, "Kaydet", "", "CSV (*.csv)")
+            if file:
+                if self.mission_manager.export_csv(name, file):
+                    self.log_message(f"CSV export: {file}")
+                else:
+                    QMessageBox.warning(self, "Hata", "Export başarısız.")
+
+    def send_mission_to_ida(self):
+        if not self.current_waypoints:
+            QMessageBox.warning(self, "Hata", "Waypoint yok.")
+            return
+        self.ida_thread.send_waypoint_mission(self.current_waypoints)
+
+    def _refresh_mission_list(self):
+        self.mission_combo.clear()
+        self.mission_combo.addItems(self.mission_manager.list_missions())
+
+    def log_message(self, msg: str):
+        self.log_text.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+
+    def closeEvent(self, event):
+        self.flush_timer.stop()
+        self.ida_thread.disconnect()
+        self.iha_thread.disconnect()
+        try:
+            if self.log_fp:
+                self.log_fp.flush()
+                self.log_fp.close()
+        except Exception:
+            pass
+        if self.mbtiles_manager:
+            self.mbtiles_manager.close()
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    w = YerKontrolIstasyonu()
+    w.show()
+    sys.exit(app.exec_())

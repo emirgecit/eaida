@@ -4,15 +4,12 @@ import os
 import math
 import csv
 import time
-import json
 import sqlite3
 import threading
-import requests
 from datetime import datetime
 from collections import deque
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from dataclasses import dataclass
 from typing import List, Optional
 from enum import Enum
 
@@ -28,7 +25,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTabWidget, QTextEdit, QFormLayout,
     QComboBox, QGroupBox, QLineEdit, QMessageBox, QFrame, QGridLayout, QScrollArea,
-    QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QDialog
+    QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtWebChannel import QWebChannel
@@ -39,7 +36,7 @@ from pymavlink import mavutil
 TILE_SERVER_PORT = 8765
 MAX_WAYPOINTS = 4
 KILL_SERVO_CHANNEL = 9
-KILL_PWM = 1900
+KILL_PWM = 2000  # TYR Raporuna göre acil durum servo PWM değeri
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MBTILES_FILE = os.path.join(BASE_DIR, "uydu_harita.mbtiles")
@@ -80,10 +77,8 @@ class VideoGraphWindow(QWidget):
         pg.setConfigOption("background", "#181825")
         pg.setConfigOption("foreground", "#cdd6f4")
 
-        self.p_speed = pg.PlotWidget(title="Gerçek Hız vs Hız İsteği (Setpoint)")
-        self.p_speed.addLegend()
-        self.curve_speed_real = self.p_speed.plot(pen=pg.mkPen("#89b4fa", width=2), name="Gerçek Hız (m/s)")
-        self.curve_speed_set = self.p_speed.plot(pen=pg.mkPen("#f38ba8", width=2, style=Qt.DashLine), name="Hız İsteği (Set)")
+        self.p_speed = pg.PlotWidget(title="Hız (m/s)")
+        self.curve_speed_real = self.p_speed.plot(pen=pg.mkPen("#89b4fa", width=2), name="Gerçek Hız")
 
         self.p_yaw = pg.PlotWidget(title="Gerçek Heading (Yaw) vs Açı İsteği (Setpoint)")
         self.p_yaw.addLegend()
@@ -107,68 +102,10 @@ class VideoGraphWindow(QWidget):
     def update_plots(self):
         if len(self.main_app.hist_speed) > 0:
             self.curve_speed_real.setData(list(self.main_app.hist_speed))
-            self.curve_speed_set.setData(list(self.main_app.hist_speed_sp))
             self.curve_yaw_real.setData(list(self.main_app.hist_yaw))
             self.curve_yaw_set.setData(list(self.main_app.hist_yaw_sp))
             self.curve_pwm_left.setData(list(self.main_app.hist_m1))
             self.curve_pwm_right.setData(list(self.main_app.hist_m3))
-
-# ==========================================
-# TEKNOFEST API THREAD
-# ==========================================
-class TeknofestAPIThread(QThread):
-    log_signal = pyqtSignal(str)
-
-    def __init__(self, takim_no, url):
-        super().__init__()
-        self.is_running = True
-        self.takim_no = takim_no
-        self.url = url
-        self.iha_data = {}
-        self.ida_data = {}
-
-    def update_data(self, iha_data, ida_data):
-        self.iha_data = iha_data
-        self.ida_data = ida_data
-
-    def run(self):
-        while self.is_running:
-            if self.iha_data or self.ida_data:
-                payload = {
-                    "takim_numarasi": self.takim_no,
-                    "IHA_enlem": self.iha_data.get("lat", 0.0),
-                    "IHA_boylam": self.iha_data.get("lon", 0.0),
-                    "IHA_irtifa": self.iha_data.get("alt", 0.0),
-                    "IHA_dikilme": self.iha_data.get("pitch", 0.0),
-                    "IHA_yonelme": self.iha_data.get("yaw", 0.0),
-                    "IHA_yatis": self.iha_data.get("roll", 0.0),
-                    "IHA_hiz": self.iha_data.get("speed", 0.0),
-                    "IHA_batarya": self.iha_data.get("battery", 100),
-                    "IHA_otonom": self.iha_data.get("is_auto", 0),
-                    "IDA_enlem": self.ida_data.get("lat", 0.0),
-                    "IDA_boylam": self.ida_data.get("lon", 0.0),
-                    "IDA_irtifa": self.ida_data.get("alt", 0.0),
-                    "IDA_dikilme": self.ida_data.get("pitch", 0.0),
-                    "IDA_yonelme": self.ida_data.get("yaw", 0.0),
-                    "IDA_yatis": self.ida_data.get("roll", 0.0),
-                    "IDA_hiz": self.ida_data.get("speed", 0.0),
-                    "IDA_batarya": self.ida_data.get("battery", 100),
-                    "IDA_otonom": self.ida_data.get("is_auto", 0)
-                }
-                try:
-                    # Saniyede 1 kez hakem sunucusuna POST atılır
-                    response = requests.post(self.url, json=payload, timeout=0.8)
-                    if response.status_code == 200:
-                        pass # Başarılıysa logu spamlama
-                    else:
-                        self.log_signal.emit(f"API Hatası (HTTP {response.status_code}): Sunucu reddetti.")
-                except Exception as e:
-                    self.log_signal.emit(f"API Bağlantı Hatası: Sunucuya ulaşılamıyor.")
-            time.sleep(1.0)
-
-    def stop(self):
-        self.is_running = False
-        self.wait()
 
 # ==========================================
 # MBTILES YEREL SUNUCU SİSTEMİ
@@ -236,7 +173,7 @@ class OfflineTileServer(threading.Thread):
         server.serve_forever()
 
 # ==========================================
-# GÜNCELLENMİŞ HTML ŞABLONU (ÇEVRİMDIŞI İKONLU)
+# ÇEVRİMDIŞI İKONLU HTML ŞABLONU
 # ==========================================
 MAP_HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -443,7 +380,7 @@ class VehicleThread(QThread):
 
     def run(self):
         lat = lon = speed = alt = roll = pitch = yaw = 0.0
-        yon_sp = hiz_sp = 0.0
+        yon_sp = wp_dist = 0.0
         mode = "BİLİNMİYOR"
         arm_status = "DISARM"
         voltaj = batarya_yuzde = gps_fix = uydu = 0
@@ -476,7 +413,7 @@ class VehicleThread(QThread):
                     if yaw < 0: yaw += 360
                 elif mt == "NAV_CONTROLLER_OUTPUT":
                     yon_sp = msg.target_bearing
-                    hiz_sp = msg.wp_dist
+                    wp_dist = msg.wp_dist
                 elif mt == "HEARTBEAT":
                     mode = mavutil.mode_string_v10(msg)
                     arm_status = "ARM" if (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED) else "DISARM"
@@ -496,8 +433,8 @@ class VehicleThread(QThread):
 
                 now = time.time()
                 if now - last_emit_time >= 0.1:
-                    if lat != 0.0 and lon != 0.0: # Null Island filter
-                        self.data_signal.emit(lat, lon, speed, alt, roll, pitch, yaw, mode, arm_status, yon_sp, hiz_sp)
+                    if lat != 0.0 and lon != 0.0: # Null Island filtresi
+                        self.data_signal.emit(lat, lon, speed, alt, roll, pitch, yaw, mode, arm_status, yon_sp, wp_dist)
                     last_emit_time = now
 
             except Exception:
@@ -538,9 +475,10 @@ class VehicleThread(QThread):
     def kill_power(self):
         if self.master:
             try:
+                # TYR Raporu uyarınca güç kesici servo motoru (2000 PWM) ile tetiklenir
                 self.master.mav.command_long_send(
                     self.master.target_system, self.master.target_component,
-                    mavutil.mavlink.MAV_CMD_DO_SET_RELAY, 0, 0, 0, 0, 0, 0, 0, 0
+                    mavutil.mavlink.MAV_CMD_DO_SET_SERVO, 0, KILL_SERVO_CHANNEL, KILL_PWM, 0, 0, 0, 0, 0
                 )
                 self.log_signal.emit(f"[{self.vehicle_type}] 🛑 ACİL DURUM TETİKLENDİ - GÜÇ KESİLİYOR")
             except Exception as e:
@@ -557,48 +495,58 @@ class VehicleThread(QThread):
                     self.master.recv_match(type="MISSION_ACK", blocking=True, timeout=1.0)
                 except: pass
 
-                mission_count = len(waypoints) + 1
-                if auto_rtl: mission_count += 1 
-                
+                # ArduPilot için sıralama mantığı: 0. Sıra Dummy (Home), 1...N gerçek WP'ler
+                upload_list = [waypoints[0]] + waypoints
+                if auto_rtl:
+                    upload_list.append("RTL")
+
+                mission_count = len(upload_list)
                 self.master.mav.mission_count_send(self.master.target_system, self.master.target_component, mission_count)
+                
                 sent = set()
                 start_t = time.time()
 
-                while len(sent) < mission_count and (time.time() - start_t) < 20.0:
+                while len(sent) < mission_count and (time.time() - start_t) < 15.0:
                     req = self.master.recv_match(type=["MISSION_REQUEST_INT", "MISSION_REQUEST"], blocking=True, timeout=2.0)
                     if not req:
-                        self.log_signal.emit(f"[{self.vehicle_type}] Timeout: MISSION_REQUEST gelmedi.")
-                        break
-
+                        continue # Ufak kopmalarda break yerine beklemeye devam et
+                    
                     seq = int(req.seq)
-                    if seq in sent: continue
+                    if seq in sent or seq >= mission_count:
+                        continue
 
-                    if seq <= len(waypoints):
-                        lat, lon = waypoints[0] if seq == 0 else waypoints[seq - 1]
-                        self.master.mav.mission_item_int_send(
-                            self.master.target_system, self.master.target_component, seq,
-                            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                            0, 1, 0, 1.5, 0, 0, int(lat * 1e7), int(lon * 1e7), 10
-                        )
-                    elif auto_rtl and seq == len(waypoints) + 1:
+                    item = upload_list[seq]
+
+                    if item == "RTL":
                         self.master.mav.mission_item_int_send(
                             self.master.target_system, self.master.target_component, seq,
                             mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
                             0, 1, 0, 0, 0, 0, 0, 0, 0
                         )
+                    else:
+                        lat, lon = item
+                        self.master.mav.mission_item_int_send(
+                            self.master.target_system, self.master.target_component, seq,
+                            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                            0, 1, 0, 1.5, 0, 0, int(lat * 1e7), int(lon * 1e7), 10
+                        )
                     sent.add(seq)
 
-                ack = self.master.recv_match(type="MISSION_ACK", blocking=True, timeout=3.0)
-                if ack and int(ack.type) == int(mavutil.mavlink.MAV_MISSION_ACCEPTED):
-                    rtl_msg = " + RTL" if auto_rtl else ""
-                    self.log_signal.emit(f"[{self.vehicle_type}] ✅ Görev Yüklendi ({len(waypoints)} WP{rtl_msg})")
+                if len(sent) == mission_count:
+                    ack = self.master.recv_match(type="MISSION_ACK", blocking=True, timeout=3.0)
+                    if ack and int(ack.type) == int(mavutil.mavlink.MAV_MISSION_ACCEPTED):
+                        rtl_msg = " + RTL" if auto_rtl else ""
+                        self.log_signal.emit(f"[{self.vehicle_type}] ✅ Görev Yüklendi ({len(waypoints)} WP{rtl_msg})")
+                    else:
+                        self.log_signal.emit(f"[{self.vehicle_type}] ⚠️ Görev iletildi ancak Onay (ACK) alınamadı!")
                 else:
-                    self.log_signal.emit(f"[{self.vehicle_type}] ⚠️ Görev iletildi ancak Onay (ACK) alınamadı!")
+                    self.log_signal.emit(f"[{self.vehicle_type}] ❌ Görev yükleme başarısız! (Bağlantı zayıf)")
 
             except Exception as e:
                 self.log_signal.emit(f"[{self.vehicle_type}] Görev yükleme hatası: {e}")
             finally:
                 self.pause_reading = False
+
         threading.Thread(target=task, daemon=True).start()
 
     def disconnect(self):
@@ -651,7 +599,7 @@ class HorizonIndicator(QWidget):
 class YerKontrolIstasyonu(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("KTÜ UZAY YGM - 2026 TEKNOFEST YKİ (ŞAMPİYON)")
+        self.setWindowTitle("KTÜ UZAY YGM - 2026 TEKNOFEST YKİ (ŞAMPİYON SÜRÜM)")
         self.setGeometry(30, 30, 1800, 1000)
         self.setStyleSheet(DARK_THEME)
 
@@ -659,7 +607,6 @@ class YerKontrolIstasyonu(QWidget):
         self.hist_yaw = deque(maxlen=200); self.hist_yaw_sp = deque(maxlen=200)
         self.hist_m1 = deque(maxlen=200); self.hist_m3 = deque(maxlen=200)
         self.hist_roll = deque(maxlen=200); self.hist_pitch = deque(maxlen=200)
-        self.iha_alt_list = deque(maxlen=100)
 
         # Çevrimdışı harita sunucusu başlat
         self.mbtiles_manager = MBTilesManager(MBTILES_FILE)
@@ -686,15 +633,8 @@ class YerKontrolIstasyonu(QWidget):
         self.iha_thread.connected_signal.connect(lambda ok: self.update_link_status("İHA", ok))
         self._ida_ok = False; self._iha_ok = False
 
-        # API Thread Başlat
-        self.api_thread = TeknofestAPIThread(takim_no="12345", url="http://127.0.0.1/api/telemetri")
-        self.api_thread.log_signal.connect(self.log_yazdir)
-        self.api_thread.start()
-
         self.kamikaze_aktif = False
         self.ida_mission_waypoints = []
-        self.current_telemetry_ida = {"lat": 0.0, "lon": 0.0, "speed": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0, "alt": 0.0, "battery": 100, "is_auto": 0}
-        self.current_telemetry_iha = {"lat": 0.0, "lon": 0.0, "speed": 0.0, "roll": 0.0, "pitch": 0.0, "yaw": 0.0, "alt": 0.0, "battery": 100, "is_auto": 0}
 
         self.is_logging = False
         self.csv_filename = ""
@@ -714,17 +654,15 @@ class YerKontrolIstasyonu(QWidget):
     def initUI(self):
         self.tabs = QTabWidget()
         self.connTab = QWidget(); self.mainTab = QWidget()
-        self.graphTab = QWidget(); self.logTab = QWidget()
+        self.graphTab = QWidget()
 
         self.tabs.addTab(self.connTab, "1. Bağlantı Ayarları")
         self.tabs.addTab(self.mainTab, "2. Operasyon Merkezi")
-        self.tabs.addTab(self.graphTab, "3. Mühendislik Analizi")
-        self.tabs.addTab(self.logTab, "4. Sistem & API Log")
+        self.tabs.addTab(self.graphTab, "3. Mühendislik Analizi ve Loglar")
 
         self.build_conn_tab()
         self.build_main_tab()
         self.build_graph_tab()
-        self.build_log_tab()
 
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 10, 10, 10)
@@ -964,46 +902,38 @@ class YerKontrolIstasyonu(QWidget):
         self.curve_pitch = self.p_attitude.plot(pen=pg.mkPen("#fab387", width=2), name="Pitch (Yunuslama) °")
         
         btn_grafik = QPushButton("🎥 Şartname Grafiklerini Aç (Ekran 2)")
-        btn_grafik.setStyleSheet("background-color: #cba6f7; color: #11111b;")
+        btn_grafik.setStyleSheet("background-color: #cba6f7; color: #11111b; margin-top:10px;")
         btn_grafik.clicked.connect(self.grafik_penceresi_ac)
         
-        right_layout.addWidget(self.p_attitude)
+        log_video_layout = QHBoxLayout()
+        self.btn_log_toggle = QPushButton("CSV Log Başlat")
+        self.btn_log_toggle.setStyleSheet("background-color: #89b4fa; color: #11111b; padding: 8px;")
+        self.btn_log_toggle.clicked.connect(self.toggle_logging)
+
+        right_layout.addWidget(self.p_attitude, 1)
         right_layout.addWidget(btn_grafik)
+        right_layout.addWidget(self.btn_log_toggle)
+        right_layout.addWidget(QLabel("Sistem Logları:"), 0)
+        
+        self.logText = QTextEdit()
+        self.logText.setReadOnly(True)
+        right_layout.addWidget(self.logText, 1)
 
         main_layout.addLayout(left_layout, 5)
         main_layout.addLayout(right_layout, 5)
         self.graphTab.setLayout(main_layout)
 
-    def build_log_tab(self):
-        layout = QVBoxLayout()
-        apiGroup = QGroupBox("Teknofest API Ayarları")
-        apiLayout = QFormLayout()
-        self.teamNoInput = QLineEdit("12345")
-        self.apiUrlInput = QLineEdit("http://127.0.0.1/api/telemetri")
-        btn = QPushButton("API Bilgilerini Güncelle")
-        btn.setStyleSheet("background-color: #89b4fa; color: #11111b;")
-        btn.clicked.connect(self.updateApiSettings)
-        apiLayout.addRow("Takım No:", self.teamNoInput)
-        apiLayout.addRow("API URL:", self.apiUrlInput)
-        apiLayout.addRow(btn)
-        apiGroup.setLayout(apiLayout)
-        layout.addWidget(apiGroup)
-
-        self.logText = QTextEdit()
-        self.logText.setReadOnly(True)
-        layout.addWidget(QLabel("Sistem & API Logları:"))
-        layout.addWidget(self.logText)
-        self.logTab.setLayout(layout)
-
-    def updateApiSettings(self):
-        self.api_thread.takim_no = self.teamNoInput.text()
-        self.api_thread.url = self.apiUrlInput.text()
-        self.log_yazdir(f"API Güncellendi: Takım {self.api_thread.takim_no} -> URL {self.api_thread.url}")
-
     def grafik_penceresi_ac(self):
         if not self.graph_window:
             self.graph_window = VideoGraphWindow(self)
         self.graph_window.show()
+
+    def toggle_follow(self):
+        self.follow_mode = not self.follow_mode
+        self.map_view.page().runJavaScript(f"window.setFollowMode({str(self.follow_mode).lower()});")
+        btn_text = "🎯 TAKİP: AÇIK" if self.follow_mode else "🎯 TAKİP: KAPALI"
+        self.sender().setText(btn_text)
+        self.log_yazdir(f"FOLLOW: {'AÇIK' if self.follow_mode else 'KAPALI'}")
 
     @pyqtSlot(str, str)
     def statustext_isle(self, vehicle, text):
@@ -1025,6 +955,23 @@ class YerKontrolIstasyonu(QWidget):
                 self.lbl_kami_mesafe.setText("<span style='color:#a6e3a1; font-weight: bold;'>TEMAS SAĞLANDI!</span>")
                 self.kamikaze_aktif = False
 
+    def toggle_logging(self):
+        if not self.is_logging:
+            self.is_logging = True
+            self.csv_filename = f"ida_telemetry_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            full_path = os.path.abspath(self.csv_filename)
+            with open(self.csv_filename, mode="w", newline="") as file:
+                writer = csv.writer(file)
+                writer.writerow(["Zaman", "Enlem", "Boylam", "Hiz (m/s)", "Roll", "Pitch", "Heading (Yaw)", "Hedefe Mesafe (m)", "Set Yon"])
+            self.btn_log_toggle.setText("CSV Kaydını Durdur")
+            self.btn_log_toggle.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 8px;")
+            self.log_yazdir(f"[LOG] Arka planda log başlatıldı.\nKaydedilen Dosya: {full_path}")
+        else:
+            self.is_logging = False
+            self.btn_log_toggle.setText("CSV Log Başlat")
+            self.btn_log_toggle.setStyleSheet("background-color: #89b4fa; color: #11111b; padding: 8px;")
+            self.log_yazdir("[LOG] Arka planda log kaydı durduruldu.")
+
     @pyqtSlot(float, float, str)
     def haritadan_waypoint_al(self, lat, lon, vehicle):
         row = self.waypointTable.rowCount()
@@ -1038,16 +985,13 @@ class YerKontrolIstasyonu(QWidget):
                 self.ida_mission_waypoints.append((lat, lon))
                 self.lbl_gorev_durum.setText(f"Nokta: <b style='color:#a6e3a1; font-size:14px;'>{len(self.ida_mission_waypoints)}/4</b>")
                 self.log_yazdir(f"Nokta Eklendi: {lat:.6f}, {lon:.6f}")
-        else:
-            pass
 
     def manuel_nokta_ekle(self):
         try:
             lat = float(self.input_lat.text().replace(",", "."))
             lon = float(self.input_lon.text().replace(",", "."))
             if len(self.ida_mission_waypoints) < MAX_WAYPOINTS:
-                self.ida_mission_waypoints.append((lat, lon))
-                self.lbl_gorev_durum.setText(f"Nokta: <b style='color:#a6e3a1; font-size:14px;'>{len(self.ida_mission_waypoints)}/4</b>")
+                # Sadece JavaScript'e komut gönder, listeye eklemeyi 'mapClicked' sinyali halledecek
                 self.map_view.page().runJavaScript(f"if(typeof addWaypointFromGCS !== 'undefined') addWaypointFromGCS({lat}, {lon});")
                 self.input_lat.clear()
                 self.input_lon.clear()
@@ -1097,26 +1041,28 @@ class YerKontrolIstasyonu(QWidget):
         text += f"GPS: <b style='color:#cdd6f4;'>{uydu} Uydu ({fix_durumu})</b></span>"
         self.lbl_iha_health.setText(text)
 
-    def ida_guncelle(self, lat, lon, speed, alt, roll, pitch, yaw, mode, arm, yon_sp, hiz_sp):
+    def ida_guncelle(self, lat, lon, speed, alt, roll, pitch, yaw, mode, arm, yon_sp, wp_dist):
         arm_color = "#a6e3a1" if arm == "ARM" else "#f38ba8"
         text = f"<span style='color:#a6e3a1; font-weight:bold; font-size:14px;'>[İDA] NAVİGASYON</span><br>"
         text += f"<span style='font-size:12px; color:#cdd6f4; line-height:1.4;'>"
         text += f"Mod: <b style='color:#cdd6f4;'>{mode}</b> | Dur: <b style='color:{arm_color}'>{arm}</b><br>"
-        text += f"Hız: <b style='color:#89b4fa;'>{speed:.1f} m/s</b> (Set: {hiz_sp:.1f})<br>"
+        text += f"Hız: <b style='color:#89b4fa;'>{speed:.1f} m/s</b> | Hedefe Mesafe: <b style='color:#89b4fa;'>{wp_dist:.1f} m</b><br>"
         text += f"Yön: <b style='color:#fab387;'>{yaw:.1f}°</b> (Set: {yon_sp:.1f}°)<br>"
         text += f"<span style='font-size:10px; color:#888888;'>Lat:{lat:.5f} Lon:{lon:.5f}</span></span>"
         self.lbl_ida_nav.setText(text)
         
         self.hist_speed.append(speed)
-        self.hist_speed_sp.append(hiz_sp)
+        self.hist_speed_sp.append(wp_dist)
         self.hist_yaw.append(yaw)
         self.hist_yaw_sp.append(yon_sp)
         self.hist_roll.append(roll)
         self.hist_pitch.append(pitch)
         
-        self.current_telemetry_ida.update({"lat": lat, "lon": lon, "speed": speed, "roll": roll, "pitch": pitch, "yaw": yaw, "alt": alt, "is_auto": 1 if mode == "AUTO" else 0})
-        self.api_thread.update_data(self.current_telemetry_iha, self.current_telemetry_ida)
-
+        if self.is_logging and self.csv_filename:
+            with open(self.csv_filename, mode="a", newline="") as file:
+                writer = csv.writer(file)
+                writer.writerow([datetime.now().strftime("%H:%M:%S"), lat, lon, speed, roll, pitch, yaw, wp_dist, yon_sp])
+        
         if self.harita_arac_secim.currentText() == "İDA":
             self.pfd.update_attitude(roll, pitch)
 
@@ -1125,7 +1071,7 @@ class YerKontrolIstasyonu(QWidget):
             self.map_view.page().runJavaScript(f"try {{ if(typeof updateIdaPosition !== 'undefined') updateIdaPosition({lat}, {lon}, {yaw}, {speed}, '{mode}'); }} catch(e) {{}}")
             self.last_map_js_ida = now
 
-    def iha_guncelle(self, lat, lon, speed, alt, roll, pitch, yaw, mode, arm, yon_sp, hiz_sp):
+    def iha_guncelle(self, lat, lon, speed, alt, roll, pitch, yaw, mode, arm, yon_sp, wp_dist):
         arm_color = "#a6e3a1" if arm == "ARM" else "#f38ba8"
         text = f"<span style='color:#89b4fa; font-weight:bold; font-size:14px;'>[İHA] NAVİGASYON</span><br>"
         text += f"<span style='font-size:12px; color:#cdd6f4; line-height:1.4;'>"
@@ -1135,11 +1081,6 @@ class YerKontrolIstasyonu(QWidget):
         text += f"<span style='font-size:10px; color:#888888;'>Lat:{lat:.5f} Lon:{lon:.5f}</span></span>"
         self.lbl_iha_nav.setText(text)
         
-        self.iha_alt_list.append(alt)
-        
-        self.current_telemetry_iha.update({"lat": lat, "lon": lon, "speed": speed, "roll": roll, "pitch": pitch, "yaw": yaw, "alt": alt, "is_auto": 1 if mode == "AUTO" else 0})
-        self.api_thread.update_data(self.current_telemetry_iha, self.current_telemetry_ida)
-
         if self.harita_arac_secim.currentText() == "İHA":
             self.pfd.update_attitude(roll, pitch)
 
@@ -1159,7 +1100,6 @@ class YerKontrolIstasyonu(QWidget):
         self.logText.verticalScrollBar().setValue(self.logText.verticalScrollBar().maximum())
 
     def closeEvent(self, event):
-        self.api_thread.stop()
         if self.tile_server:
             self.mbtiles_manager.close()
         self.ida_thread.disconnect()

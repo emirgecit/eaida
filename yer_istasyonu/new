@@ -26,7 +26,8 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot, QObject, QTimer, QUr
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QTabWidget, QTextEdit, QFormLayout,
-    QComboBox, QGroupBox, QLineEdit, QMessageBox, QFrame, QGridLayout, QScrollArea
+    QComboBox, QGroupBox, QLineEdit, QMessageBox, QFrame, QGridLayout, QScrollArea,
+    QCheckBox
 )
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 from PyQt5.QtWebChannel import QWebChannel
@@ -38,8 +39,9 @@ TILE_SERVER_PORT = 8765
 MAX_WAYPOINTS = 4
 KILL_SERVO_CHANNEL = 9
 KILL_PWM = 1900
-MBTILES_FILE = "uydu_harita.mbtiles"
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MBTILES_FILE = os.path.join(BASE_DIR, "uydu_harita.mbtiles")
 
 # ==========================================
 # EKRAN 2: TEKNOFEST GRAFİK PENCERESİ
@@ -81,14 +83,24 @@ class VideoGraphWindow(QWidget):
         self.timer.start(200)
 
     def update_plots(self):
+        
         if len(self.main_app.hist_speed) > 0:
-            x = list(range(len(self.main_app.hist_speed)))
-            self.curve_speed_real.setData(x, list(self.main_app.hist_speed))
-            self.curve_speed_set.setData(x, list(self.main_app.hist_speed_sp))
-            self.curve_yaw_real.setData(x, list(self.main_app.hist_yaw))
-            self.curve_yaw_set.setData(x, list(self.main_app.hist_yaw_sp))
-            self.curve_pwm_left.setData(x, list(self.main_app.hist_m1))
-            self.curve_pwm_right.setData(x, list(self.main_app.hist_m3))
+            self.curve_speed_real.setData(list(self.main_app.hist_speed))
+            
+        if len(self.main_app.hist_speed_sp) > 0:
+            self.curve_speed_set.setData(list(self.main_app.hist_speed_sp))
+            
+        if len(self.main_app.hist_yaw) > 0:
+            self.curve_yaw_real.setData(list(self.main_app.hist_yaw))
+            
+        if len(self.main_app.hist_yaw_sp) > 0:
+            self.curve_yaw_set.setData(list(self.main_app.hist_yaw_sp))
+            
+        if len(self.main_app.hist_m1) > 0:
+            self.curve_pwm_left.setData(list(self.main_app.hist_m1))
+            
+        if len(self.main_app.hist_m3) > 0:
+            self.curve_pwm_right.setData(list(self.main_app.hist_m3))
 
 
 # ==========================================
@@ -164,6 +176,9 @@ class OfflineTileServer(threading.Thread):
         server.serve_forever()
 
 
+# ==========================================
+# GÜNCELLENMİŞ HARİTA ŞABLONU (GÖRÜŞ KONİSİ İLE)
+# ==========================================
 MAP_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -174,9 +189,19 @@ MAP_HTML_TEMPLATE = """
     .info-panel {{ background: rgba(30, 30, 30, 0.95); color: #e0e0e0; padding: 10px; border-radius: 5px; border: 2px solid #00e5ff; font-size: 11px; }}
     .badge {{ position:fixed; left:10px; bottom:10px; background:#2e7d32; color:#fff; padding:6px 10px; border-radius:4px; font-size:11px; z-index:9999; }}
     .badge2 {{ position:fixed; left:10px; bottom:44px; background:#263238; color:#fff; padding:6px 10px; border-radius:4px; font-size:11px; z-index:9999; opacity:0.9; }}
+    
+    /* KARO SIZINTISINI ÖNLEYEN KRİTİK CSS HACK */
+    .leaflet-tile-container img {{
+        outline: 1px solid transparent;
+        -webkit-backface-visibility: hidden;
+    }}
+    
+    /* GÖRÜŞ KONİSİ İÇİN ŞEFFAF İKON SINIFI */
+    .custom-cone-marker {{ background: transparent !important; border: none !important; }}
   </style>
-  <link rel="stylesheet" href="leaflet/leaflet.css" />
-  <script src="leaflet/leaflet.js"></script>
+  
+  <link rel="stylesheet" href="file://{leaflet_css}" />
+  <script src="file://{leaflet_js}"></script>
   <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 </head>
 <body>
@@ -188,10 +213,36 @@ MAP_HTML_TEMPLATE = """
     const TILE_URL = "{tile_url}";
     const ENABLE_TILES = {enable_tiles};
 
-    let map = L.map('map').setView([41.008694, 39.768233], 18);
+    const centerLat = 40.9985368;
+    const centerLon = 39.768233;
+    
+    const bounds = L.latLngBounds(
+        [centerLat - 0.050, centerLon - 0.065],
+        [centerLat + 0.050, centerLon + 0.065]
+    );
+
+    let map = L.map('map', {{
+        center: [centerLat, centerLon],
+        zoom: 17,
+        minZoom: 14,
+        maxZoom: 23,
+        maxBounds: bounds,
+        maxBoundsViscosity: 1.0,
+        zoomSnap: 1,
+        zoomDelta: 1,
+        wheelPxPerZoomLevel: 60
+    }});
 
     if (ENABLE_TILES) {{
-      L.tileLayer(TILE_URL, {{ maxZoom: 20, minZoom: 5, tms: true }}).addTo(map);
+      L.tileLayer(TILE_URL, {{ 
+          minZoom: 14,
+          maxZoom: 23,
+          maxNativeZoom: 19,
+          tms: true,
+          bounds: bounds,
+          updateWhenIdle: false,
+          updateWhenZooming: true
+      }}).addTo(map);
     }} else {{
       const err = L.control({{position:'topright'}});
       err.onAdd = function() {{
@@ -248,7 +299,7 @@ MAP_HTML_TEMPLATE = """
 
     window.centerMap = function() {{
         if (idaMarker) map.setView(idaMarker.getLatLng(), 18);
-        else map.setView([41.008694, 39.768233], 18);
+        else map.setView([centerLat, centerLon], 18);
     }};
 
     window.setVehicle = function(vehicle) {{ selectedVehicle = vehicle; }};
@@ -287,22 +338,69 @@ MAP_HTML_TEMPLATE = """
         if (ihaTarget) {{ map.removeLayer(ihaTarget); ihaTarget = null; }}
     }};
 
+    // ==========================================
+    // YENİ: DİNAMİK YÖN GÖSTERGELİ İKON ÜRETİCİ (Genişletilmiş Optimum Boyut)
+    // ==========================================
+    function getVehicleIcon(vehicle, heading) {{
+        let color = vehicle === 'İDA' ? '#00e5ff' : '#d50000';
+        let rotId = vehicle === 'İDA' ? 'ida-rot' : 'iha-rot';
+        
+        // Kutu boyutu 120x120 yapıldı. Koni uzunluğu 55 piksel (çok daha belirgin). 
+        // Merkezdeki tekne ikonu ise kibar ve net (yarıçap 8).
+        let html = '<div id="' + rotId + '" style="width: 120px; height: 120px; transform: rotate(' + heading + 'deg); transform-origin: center center; transition: transform 0.15s linear;">' +
+                   '<svg width="120" height="120" viewBox="0 0 120 120">' +
+                   '  ' +
+                   '  <path d="M 60 60 L 32.5 12.4 A 55 55 0 0 1 87.5 12.4 Z" fill="' + color + '" fill-opacity="0.35" />' +
+                   '  ' +
+                   '  <circle cx="60" cy="60" r="8" fill="' + color + '" stroke="#ffffff" stroke-width="2.5" style="filter: drop-shadow(0px 2px 4px rgba(0,0,0,0.6));" />' +
+                   '</svg></div>';
+        
+        return L.divIcon({{
+            className: 'custom-cone-marker',
+            html: html,
+            iconSize: [120, 120],
+            iconAnchor: [60, 60] // Tam merkezi (60,60) koordinatlarına sabitliyoruz
+        }});
+    }}
+
+    // İDA GÜNCELLEMESİ
     window.updateIdaPosition = function(lat, lon, heading, speed, mode) {{
         if (!idaMarker) {{
-            idaMarker = L.circleMarker([lat, lon], {{radius:8, fillColor:'#00e5ff', color:'#fff', weight:2, fillOpacity:1}}).addTo(map);
+            // İlk kez oluşturuluyorsa yeni ikonu atıyoruz
+            idaMarker = L.marker([lat, lon], {{icon: getVehicleIcon('İDA', heading), zIndexOffset: 1000}}).addTo(map);
+        }} else {{
+            // Zaten varsa pozisyonu güncelle
+            idaMarker.setLatLng([lat, lon]);
+            
+            // Performans Hack: Tüm ikonu baştan yaratmak yerine sadece HTML'deki div'in rotasyonunu çeviriyoruz
+            let rotDiv = document.getElementById('ida-rot');
+            if (rotDiv) {{
+                rotDiv.style.transform = 'rotate(' + heading + 'deg)';
+            }} else {{
+                idaMarker.setIcon(getVehicleIcon('İDA', heading));
+            }}
         }}
-        idaMarker.setLatLng([lat, lon]);
+        
+        // Arkadaki iz (Path)
         idaPath.push([lat, lon]);
         if (idaPath.length > 500) idaPath.shift();
         idaPolyline.setLatLngs(idaPath);
         if (window.followMode) map.setView([lat, lon], map.getZoom());
     }};
 
+    // İHA GÜNCELLEMESİ
     window.updateIhaPosition = function(lat, lon, heading, altitude, mode) {{
         if (!ihaMarker) {{
-            ihaMarker = L.circleMarker([lat, lon], {{radius:6, fillColor:'#d50000', color:'#fff', weight:2, fillOpacity:0.8}}).addTo(map);
+            ihaMarker = L.marker([lat, lon], {{icon: getVehicleIcon('İHA', heading), zIndexOffset: 900}}).addTo(map);
+        }} else {{
+            ihaMarker.setLatLng([lat, lon]);
+            let rotDiv = document.getElementById('iha-rot');
+            if (rotDiv) {{
+                rotDiv.style.transform = 'rotate(' + heading + 'deg)';
+            }} else {{
+                ihaMarker.setIcon(getVehicleIcon('İHA', heading));
+            }}
         }}
-        ihaMarker.setLatLng([lat, lon]);
     }};
 </script>
 </body>
@@ -316,11 +414,12 @@ class MapBridge(QObject):
     def mapClicked(self, lat, lon, vehicle):
         self.waypoint_signal.emit(lat, lon, vehicle)
 
-
+# HOLD ve RTL modları eklendi
 class VehicleMode(Enum):
     MANUAL = 0
     GUIDED = 4
     AUTO = 10
+    RTL = 11
     HOLD = 16
 
 
@@ -418,7 +517,9 @@ class VehicleThread(QThread):
 
                 now = time.time()
                 if now - last_emit_time >= 0.1:
-                    self.data_signal.emit(lat, lon, speed, alt, roll, pitch, yaw, mode, arm_status, yon_sp, hiz_sp)
+                    # SIFIR NOKTASI (NULL ISLAND) FİLTRESİ
+                    if lat != 0.0 and lon != 0.0:
+                        self.data_signal.emit(lat, lon, speed, alt, roll, pitch, yaw, mode, arm_status, yon_sp, hiz_sp)
                     last_emit_time = now
 
             except Exception:
@@ -470,7 +571,7 @@ class VehicleThread(QThread):
             except Exception as e:
                 self.log_signal.emit(f"[{self.vehicle_type}] KILL hatası: {e}")
 
-    def upload_mission_thread_safe(self, waypoints):
+    def upload_mission_thread_safe(self, waypoints, auto_rtl=True):
         def task():
             if not self.master:
                 return
@@ -485,6 +586,9 @@ class VehicleThread(QThread):
                     pass
 
                 mission_count = len(waypoints) + 1
+                if auto_rtl:
+                    mission_count += 1 
+                
                 self.master.mav.mission_count_send(self.master.target_system, self.master.target_component, mission_count)
 
                 sent = set()
@@ -500,26 +604,31 @@ class VehicleThread(QThread):
                     if seq in sent:
                         continue
 
-                    if seq == 0:
-                        lat, lon = waypoints[0]
-                    elif seq <= len(waypoints):
-                        lat, lon = waypoints[seq - 1]
-                    else:
-                        continue
-
-                    self.master.mav.mission_item_int_send(
-                        self.master.target_system, self.master.target_component, seq,
-                        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
-                        mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                        0, 1,
-                        0, 1.5, 0, 0,
-                        int(lat * 1e7), int(lon * 1e7), 10
-                    )
+                    # NORMAL GÖREV NOKTALARI
+                    if seq <= len(waypoints):
+                        lat, lon = waypoints[0] if seq == 0 else waypoints[seq - 1]
+                        self.master.mav.mission_item_int_send(
+                            self.master.target_system, self.master.target_component, seq,
+                            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                            mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                            0, 1, 0, 1.5, 0, 0,
+                            int(lat * 1e7), int(lon * 1e7), 10
+                        )
+                    # OPSIYONEL SON NOKTA: OTOMATİK RTL KOMUTU
+                    elif auto_rtl and seq == len(waypoints) + 1:
+                        self.master.mav.mission_item_int_send(
+                            self.master.target_system, self.master.target_component, seq,
+                            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                            mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+                            0, 1, 0, 0, 0, 0,
+                            0, 0, 0
+                        )
                     sent.add(seq)
 
                 ack = self.master.recv_match(type="MISSION_ACK", blocking=True, timeout=3.0)
                 if ack and int(ack.type) == int(mavutil.mavlink.MAV_MISSION_ACCEPTED):
-                    self.log_signal.emit(f"[{self.vehicle_type}] ✅ Görev BAŞARIYLA yüklendi: {len(waypoints)} WP")
+                    rtl_msg = " + RTL" if auto_rtl else ""
+                    self.log_signal.emit(f"[{self.vehicle_type}] ✅ Görev Yüklendi ({len(waypoints)} WP{rtl_msg})")
                 else:
                     self.log_signal.emit(f"[{self.vehicle_type}] ⚠️ Görev iletildi ancak Onay (ACK) alınamadı!")
 
@@ -844,14 +953,30 @@ class YerKontrolIstasyonu(QWidget):
         btn_ida_manual.setStyleSheet("background-color: #e65100; color: white;")
         btn_ida_manual.clicked.connect(lambda: self.ida_thread.set_mode(VehicleMode.MANUAL))
 
-        btn_follow = QPushButton("🎯 FOLLOW: ON/OFF")
+        btn_ida_rtl = QPushButton("EVE DÖN (ACİL RTL)")
+        btn_ida_rtl.setStyleSheet("background-color: #fbc02d; color: black; font-weight: bold;")
+        btn_ida_rtl.clicked.connect(lambda: self.ida_thread.set_mode(VehicleMode.RTL))
+
+        btn_ida_hold = QPushButton("SABİTLE (HOLD)")
+        btn_ida_hold.setStyleSheet("background-color: #0288d1; color: white;")
+        btn_ida_hold.clicked.connect(lambda: self.ida_thread.set_mode(VehicleMode.HOLD))
+
+        btn_follow = QPushButton("🎯 TAKİP: AÇIK")
+        btn_follow.setStyleSheet("background-color: #2d2d30; color: white;")
         btn_follow.clicked.connect(self.toggle_follow)
 
         arm_layout.addWidget(btn_ida_arm, 0, 0)
         arm_layout.addWidget(btn_ida_disarm, 0, 1)
         arm_layout.addWidget(btn_ida_manual, 1, 0)
-        arm_layout.addWidget(btn_follow, 1, 1)
+        arm_layout.addWidget(btn_ida_rtl, 1, 1)
+        arm_layout.addWidget(btn_ida_hold, 2, 0)
+        arm_layout.addWidget(btn_follow, 2, 1)
         kontrol_l.addLayout(arm_layout)
+
+        self.cb_auto_rtl = QCheckBox("Görev Sonu EVE DÖN (Otomatik RTL)")
+        self.cb_auto_rtl.setChecked(True)
+        self.cb_auto_rtl.setStyleSheet("color: #e0e0e0; font-weight: bold; margin-top: 5px;")
+        kontrol_l.addWidget(self.cb_auto_rtl)
 
         self.btn_gorev_gonder = QPushButton("GÖREVİ YÜKLE")
         self.btn_gorev_gonder.setStyleSheet("background-color: #1565c0; color: white; padding: 10px; font-size:13px;")
@@ -913,12 +1038,21 @@ class YerKontrolIstasyonu(QWidget):
         scroll_area.setWidget(sidebar_widget)
 
         self.map_view = QWebEngineView()
+        
+        self.map_view.settings().setAttribute(self.map_view.settings().LocalContentCanAccessFileUrls, True)
+        self.map_view.settings().setAttribute(self.map_view.settings().LocalContentCanAccessRemoteUrls, True)
+
         try:
             base_path = os.path.dirname(os.path.abspath(__file__))
         except NameError:
             base_path = os.getcwd()
 
+        leaflet_css_path = os.path.join(base_path, "leaflet", "leaflet.css").replace("\\", "/")
+        leaflet_js_path = os.path.join(base_path, "leaflet", "leaflet.js").replace("\\", "/")
+
         html = MAP_HTML_TEMPLATE.format(
+            leaflet_css=leaflet_css_path,
+            leaflet_js=leaflet_js_path,
             tile_url=f"http://127.0.0.1:{TILE_SERVER_PORT}/tile/{{z}}/{{x}}/{{y}}",
             enable_tiles="true" if self.mbtiles_manager.has_offline_map else "false",
             max_wps=MAX_WAYPOINTS
@@ -976,6 +1110,10 @@ class YerKontrolIstasyonu(QWidget):
     def toggle_follow(self):
         self.follow_mode = not self.follow_mode
         self.map_view.page().runJavaScript(f"window.setFollowMode({str(self.follow_mode).lower()});")
+        
+        btn_text = "🎯 TAKİP: AÇIK" if self.follow_mode else "🎯 TAKİP: KAPALI"
+        self.sender().setText(btn_text)
+        
         self.log_yazdir(f"FOLLOW: {'AÇIK' if self.follow_mode else 'KAPALI'}")
 
     @pyqtSlot(str, str)
@@ -1054,8 +1192,11 @@ class YerKontrolIstasyonu(QWidget):
             QMessageBox.warning(self, "Eksik Nokta", "Lütfen haritadan nokta belirleyin!")
             return
 
-        self.log_yazdir("[OTONOMİ] Görev Thread üzerinden araca gönderiliyor...")
-        self.ida_thread.upload_mission_thread_safe(self.ida_mission_waypoints)
+        auto_rtl_enabled = self.cb_auto_rtl.isChecked()
+        durum_metni = "AÇIK" if auto_rtl_enabled else "KAPALI"
+        
+        self.log_yazdir(f"[OTONOMİ] Görev araca gönderiliyor... (Otomatik RTL: {durum_metni})")
+        self.ida_thread.upload_mission_thread_safe(self.ida_mission_waypoints, auto_rtl_enabled)
 
     @pyqtSlot(int, int)
     def ida_servo_guncelle(self, m1, m3):
@@ -1105,7 +1246,6 @@ class YerKontrolIstasyonu(QWidget):
         if self.harita_arac_secim.currentText() == "İDA":
             self.pfd.update_attitude(roll, pitch)
 
-        # Harita optimizasyonu (5 Hz)
         now = time.time()
         if now - self.last_map_js_ida >= 0.2:
             self.map_view.page().runJavaScript(
@@ -1127,7 +1267,6 @@ class YerKontrolIstasyonu(QWidget):
         if self.harita_arac_secim.currentText() == "İHA":
             self.pfd.update_attitude(roll, pitch)
 
-        # Harita optimizasyonu (5 Hz)
         now = time.time()
         if now - self.last_map_js_iha >= 0.2:
             self.map_view.page().runJavaScript(

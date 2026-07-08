@@ -36,9 +36,6 @@ KILL_PWM = 2000  # TYR Raporuna göre acil durum servo PWM değeri
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MBTILES_FILE = os.path.join(BASE_DIR, "uydu_harita.mbtiles")
 
-# ==========================================
-# KARANLIK TEMA
-# ==========================================
 DARK_THEME = """
 QWidget { background-color: #1e1e2e; color: #cdd6f4; font-family: 'Segoe UI', Arial; font-size: 13px; }
 QPushButton { border: 1px solid #45475a; border-radius: 4px; padding: 8px; font-weight: bold; font-size: 13px; }
@@ -64,31 +61,25 @@ class VideoGraphWindow(QWidget):
         self.setWindowTitle("TEKNOFEST EKRAN 2: Otonomi Grafikleri")
         self.setGeometry(100, 500, 600, 500)
         self.setStyleSheet(DARK_THEME)
-
         layout = QVBoxLayout()
         pg.setConfigOption("background", "#181825")
         pg.setConfigOption("foreground", "#cdd6f4")
-
         self.p_speed = pg.PlotWidget(title="Hız (m/s) ve Hız İsteği")
         self.p_speed.addLegend()
         self.curve_speed_real = self.p_speed.plot(pen=pg.mkPen("#89b4fa", width=2), name="Gerçek Hız")
         self.curve_speed_set = self.p_speed.plot(pen=pg.mkPen("#f9e2af", width=2, style=Qt.DashLine), name="Hız İsteği (Set)")
-
         self.p_yaw = pg.PlotWidget(title="Gerçek Heading (Yaw) vs Açı İsteği (Setpoint)")
         self.p_yaw.addLegend()
         self.curve_yaw_real = self.p_yaw.plot(pen=pg.mkPen("#a6e3a1", width=2), name="Gerçek Yaw (°)")
         self.curve_yaw_set = self.p_yaw.plot(pen=pg.mkPen("#fab387", width=2, style=Qt.DashLine), name="Yaw İsteği (Set)")
-
         self.p_pwm = pg.PlotWidget(title="Thrusterlardan Kuvvet İsteği (PWM Sinyali)")
         self.p_pwm.addLegend()
         self.curve_pwm_left = self.p_pwm.plot(pen=pg.mkPen("#f38ba8", width=2), name="Sol Thruster (CH1)")
         self.curve_pwm_right = self.p_pwm.plot(pen=pg.mkPen("#89b4fa", width=2), name="Sağ Thruster (CH3)")
-
         layout.addWidget(self.p_speed)
         layout.addWidget(self.p_yaw)
         layout.addWidget(self.p_pwm)
         self.setLayout(layout)
-
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plots)
         self.timer.start(200)
@@ -113,7 +104,6 @@ class MBTilesManager:
                 self.has_offline_map = True
             except Exception:
                 self.has_offline_map = False
-
     def get_tile(self, zoom: int, x: int, y: int) -> Optional[bytes]:
         if not self.conn: return None
         try:
@@ -124,7 +114,6 @@ class MBTilesManager:
             return row[0] if row else None
         except Exception:
             return None
-
     def close(self):
         if self.conn: self.conn.close()
 
@@ -173,7 +162,6 @@ MAP_HTML_TEMPLATE = """
     html, body, #map {{ height: 100%; width: 100%; margin: 0; padding: 0; background-color: #1e1e2e; }}
     .info-panel {{ background: rgba(30, 30, 30, 0.95); color: #cdd6f4; padding: 10px; border-radius: 5px; border: 2px solid #89b4fa; font-size: 11px; }}
     .badge {{ position:fixed; left:10px; bottom:10px; background:#a6e3a1; color:#11111b; padding:6px 10px; border-radius:4px; font-size:11px; z-index:9999; font-weight:bold; }}
-    
     .leaflet-tile-container img {{ outline: 1px solid transparent; -webkit-backface-visibility: hidden; }}
     .custom-cone-marker {{ background: transparent !important; border: none !important; }}
   </style>
@@ -184,21 +172,17 @@ MAP_HTML_TEMPLATE = """
 <body>
 <div id="map"></div>
 <div class="badge">MBTILES OFFLINE</div>
-
 <script>
     const TILE_URL = "{tile_url}";
     const ENABLE_TILES = {enable_tiles};
     const centerLat = 40.9985368;
     const centerLon = 39.768233; 
-    
     const bounds = L.latLngBounds([centerLat - 0.050, centerLon - 0.065], [centerLat + 0.050, centerLon + 0.065]);
-
     let map = L.map('map', {{
         center: [centerLat, centerLon],
         zoom: 17, minZoom: 14, maxZoom: 23, maxBounds: bounds, maxBoundsViscosity: 1.0,
         zoomSnap: 1, zoomDelta: 1, wheelPxPerZoomLevel: 60
     }});
-
     if (ENABLE_TILES) {{
       L.tileLayer(TILE_URL, {{ 
           minZoom: 14, maxZoom: 23, maxNativeZoom: 19, tms: true, bounds: bounds,
@@ -213,7 +197,6 @@ MAP_HTML_TEMPLATE = """
       }}
       err.addTo(map);
     }}
-
     let bridge = null;
     let idaMarker = null, idaPath = [], idaPolyline = L.polyline([], {{color:'#89b4fa', weight:3}}).addTo(map);
     let ihaMarker = null, ihaPath = [], ihaPolyline = L.polyline([], {{color:'#f38ba8', weight:2}}).addTo(map);
@@ -221,12 +204,9 @@ MAP_HTML_TEMPLATE = """
     let waypointMarkers = [];
     let waypointPolyline = null;
     let missionLayer = L.layerGroup().addTo(map);
-
     let selectedVehicle = "İDA";
     window.followMode = true;
-
     new QWebChannel(qt.webChannelTransport, function(channel) {{ bridge = channel.objects.bridge; }});
-
     map.on('click', function(e) {{
         let lat = e.latlng.lat; let lon = e.latlng.lng;
         if (selectedVehicle === "İDA") {{
@@ -239,18 +219,13 @@ MAP_HTML_TEMPLATE = """
             if (bridge) bridge.mapClicked(lat, lon, selectedVehicle);
         }}
     }});
-
     window.setFollowMode = function(on) {{ window.followMode = !!on; }};
-
     window.centerMap = function() {{
         if (idaMarker) map.setView(idaMarker.getLatLng(), 18);
         else map.setView([centerLat, centerLon], 18);
     }};
-
     window.setVehicle = function(vehicle) {{ selectedVehicle = vehicle; }};
-
     window.addWaypointFromGCS = function(lat, lon) {{ window.addMissionWaypoint(lat, lon); }};
-
     window.addMissionWaypoint = function(lat, lon) {{
         let idx = waypointMarkers.length;
         let marker = L.marker([lat, lon], {{
@@ -259,18 +234,15 @@ MAP_HTML_TEMPLATE = """
                 iconSize: [32, 32], iconAnchor: [16, 16]
             }})
         }}).bindPopup('<div class="info-panel"><b>WP ' + (idx + 1) + '</b><br>Lat: ' + lat.toFixed(6) + '<br>Lon: ' + lon.toFixed(6) + '</div>');
-
         marker.addTo(missionLayer);
         waypointMarkers.push({{marker: marker, lat: lat, lon: lon}});
         if (bridge) bridge.mapClicked(lat, lon, "İDA");
         window.updateMissionLine();
     }};
-
     window.removeWaypoint = function(index) {{
         if (index >= 0 && index < waypointMarkers.length) {{
             missionLayer.removeLayer(waypointMarkers[index].marker);
             waypointMarkers.splice(index, 1);
-            
             waypointMarkers.forEach((w, idx) => {{
                 let html = '<div style="background-color:#fab387;color:#11111b;border-radius:50%;width:32px;height:32px;display:flex;align-items:center;justify-content:center;font-weight:bold;border:2px solid #11111b; font-size:14px;">' + (idx + 1) + '</div>';
                 w.marker.setIcon(L.divIcon({{html: html, iconSize: [32, 32], iconAnchor: [16, 16]}}));
@@ -279,21 +251,18 @@ MAP_HTML_TEMPLATE = """
             window.updateMissionLine();
         }}
     }};
-
     window.updateMissionLine = function() {{
         if (waypointPolyline) missionLayer.removeLayer(waypointPolyline);
         let coords = waypointMarkers.map(w => [w.lat, w.lon]);
         waypointPolyline = L.polyline(coords, {{color:'#fab387', weight:3, dashArray:'6, 6'}});
         waypointPolyline.addTo(missionLayer);
     }};
-
     window.clearMission = function() {{
         waypointMarkers.forEach(w => missionLayer.removeLayer(w.marker));
         waypointMarkers = [];
         if (waypointPolyline) missionLayer.removeLayer(waypointPolyline);
         if (ihaTarget) {{ map.removeLayer(ihaTarget); ihaTarget = null; }}
     }};
-
     function getVehicleIcon(vehicle, heading) {{
         let color = vehicle === 'İDA' ? '#89b4fa' : '#f38ba8';
         let rotId = vehicle === 'İDA' ? 'ida-rot' : 'iha-rot';
@@ -304,7 +273,6 @@ MAP_HTML_TEMPLATE = """
                    '</svg></div>';
         return L.divIcon({{ className: 'custom-cone-marker', html: html, iconSize: [130, 130], iconAnchor: [65, 65] }});
     }}
-
     window.updateIdaPosition = function(lat, lon, heading, speed, mode) {{
         if (!idaMarker) {{
             idaMarker = L.marker([lat, lon], {{icon: getVehicleIcon('İDA', heading), zIndexOffset: 1000}}).addTo(map);
@@ -319,7 +287,6 @@ MAP_HTML_TEMPLATE = """
         idaPolyline.setLatLngs(idaPath);
         if (window.followMode) map.setView([lat, lon], map.getZoom());
     }};
-
     window.updateIhaPosition = function(lat, lon, heading, altitude, mode) {{
         if (!ihaMarker) {{
             ihaMarker = L.marker([lat, lon], {{icon: getVehicleIcon('İHA', heading), zIndexOffset: 900}}).addTo(map);
@@ -400,8 +367,8 @@ class VehicleThread(QThread):
         except PermissionError:
             self.is_running = False
             self.connected_signal.emit(False)
-            self.log_signal.emit(f"[{self.vehicle_type}] ❌ HATA: Port meşgul! Mission Planner veya diğer test kodu arkada açık kalmış olabilir.")
-            QMessageBox.critical(None, "Port Meşgul", "Seçtiğiniz COM portu şu an başka bir program tarafından kullanılıyor. Lütfen Mission Planner'ı veya diğer pencereleri kapatın.")
+            self.log_signal.emit(f"[{self.vehicle_type}] ❌ HATA: Port meşgul! Programı veya terminali kapatın.")
+            QMessageBox.critical(None, "Port Meşgul", "Seçtiğiniz COM portu şu an başka bir program tarafından kullanılıyor. Lütfen Mission Planner'ı veya diğer komut pencerelerini kapatın.")
         except Exception as e:
             self.is_running = False
             self.connected_signal.emit(False)
@@ -462,8 +429,8 @@ class VehicleThread(QThread):
 
                 now = time.time()
                 if now - last_emit_time >= 0.1:
-                    if lat != 0.0 and lon != 0.0:
-                        self.data_signal.emit(lat, lon, speed, alt, roll, pitch, yaw, mode, arm_status, yon_sp, wp_dist)
+                    # DİKKAT: Konum (lat/lon) 0.0 olsa bile ivme verisini (roll/pitch) arayüze basıyoruz!
+                    self.data_signal.emit(lat, lon, speed, alt, roll, pitch, yaw, mode, arm_status, yon_sp, wp_dist)
                     last_emit_time = now
 
             except Exception:
@@ -532,11 +499,18 @@ class VehicleThread(QThread):
                 
                 sent = set()
                 start_t = time.time()
+                retry_count = 0
 
                 while len(sent) < mission_count and (time.time() - start_t) < 15.0:
                     req = self.master.recv_match(type=["MISSION_REQUEST_INT", "MISSION_REQUEST"], blocking=True, timeout=2.0)
                     if not req:
-                        continue 
+                        if len(sent) == 0 and retry_count < 3:
+                            self.master.mav.mission_count_send(self.master.target_system, self.master.target_component, mission_count)
+                            retry_count += 1
+                            continue
+                        else:
+                            self.log_signal.emit(f"[{self.vehicle_type}] Timeout: MISSION_REQUEST gelmedi (Bağlantı zayıf).")
+                            break
                     
                     seq = int(req.seq)
                     if seq in sent or seq >= mission_count:
@@ -628,7 +602,7 @@ class HorizonIndicator(QWidget):
 class YerKontrolIstasyonu(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("KTÜ UZAY YGM - 2026 TEKNOFEST YKİ (ŞAMPİYON SÜRÜM)")
+        self.setWindowTitle("YomraGM Fırtına KTÜ UZAY D-3 (WİNDOWS)")
         self.setGeometry(30, 30, 1800, 1000)
         self.setStyleSheet(DARK_THEME)
 
@@ -708,8 +682,8 @@ class YerKontrolIstasyonu(QWidget):
         self.mainTab = QWidget()
         self.graphTab = QWidget()
 
-        self.tabs.addTab(self.mainTab, "1. Operasyon Merkezi")
-        self.tabs.addTab(self.graphTab, "2. Mühendislik Analizi ve Loglar")
+        self.tabs.addTab(self.mainTab, "Operasyon Merkezi")
+        self.tabs.addTab(self.graphTab, "Mühendislik Analizi ve Loglar")
 
         self.build_main_tab()
         self.build_graph_tab()
@@ -893,9 +867,11 @@ class YerKontrolIstasyonu(QWidget):
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setWidget(sidebar_widget)
-        scroll_area.setMinimumWidth(440) 
+        scroll_area.setMinimumWidth(500) 
 
         self.map_view = QWebEngineView()
+        self.map_view.settings().setAttribute(self.map_view.settings().LocalContentCanAccessFileUrls, True)
+        self.map_view.settings().setAttribute(self.map_view.settings().LocalContentCanAccessRemoteUrls, True)
         try: base_path = os.path.dirname(os.path.abspath(__file__))
         except NameError: base_path = os.getcwd()
 
@@ -919,8 +895,8 @@ class YerKontrolIstasyonu(QWidget):
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(scroll_area)
         splitter.addWidget(self.map_view)
-        splitter.setStretchFactor(0, 35)
-        splitter.setStretchFactor(1, 65)
+        splitter.setStretchFactor(0, 40)
+        splitter.setStretchFactor(1, 60)
 
         main_h_layout.addWidget(splitter)
         self.mainTab.setLayout(main_h_layout)
@@ -932,7 +908,7 @@ class YerKontrolIstasyonu(QWidget):
         
         available_ports = self.get_serial_ports()
 
-        ida_group = QGroupBox("İDA Telemetri Bağlantısı - 868 MHz")
+        ida_group = QGroupBox("İDA Telemetri Bağlantısı")
         ida_layout = QFormLayout()
         self.ida_port = QComboBox(); self.ida_port.setEditable(True)
         self.ida_port.addItems(["udp:127.0.0.1:14550", "tcp:127.0.0.1:5760"] + available_ports)
@@ -944,7 +920,7 @@ class YerKontrolIstasyonu(QWidget):
         ida_layout.addRow("Port/Bağlantı:", self.ida_port); ida_layout.addRow("Baud Rate:", self.ida_baud); ida_layout.addRow("", self.ida_conn_btn)
         ida_group.setLayout(ida_layout)
 
-        iha_group = QGroupBox("İHA Telemetri Bağlantısı - 433 MHz")
+        iha_group = QGroupBox("İHA Telemetri Bağlantısı")
         iha_layout = QFormLayout()
         self.iha_port = QComboBox(); self.iha_port.setEditable(True)
         self.iha_port.addItems(["udp:127.0.0.1:14552", "tcp:127.0.0.1:5762"] + available_ports)
@@ -1032,7 +1008,7 @@ class YerKontrolIstasyonu(QWidget):
             full_path = os.path.abspath(self.csv_filename)
             with open(self.csv_filename, mode="w", newline="") as file:
                 writer = csv.writer(file)
-                writer.writerow(["Zaman", "Enlem", "Boylam", "Hiz (m/s)", "Roll", "Pitch", "Heading (Yaw)", "Hedefe Mesafe (m)", "Set Yon"])
+                writer.writerow(["Zaman", "Enlem", "Boylam", "Hiz (m/s)", "Roll", "Pitch", "Heading (Yaw)", "Set Yon"])
             self.btn_log_toggle.setText("CSV Kaydını Durdur")
             self.btn_log_toggle.setStyleSheet(self.buton_stili_olustur("#f38ba8", "#ea769b"))
             self.log_yazdir(f"[LOG] Arka planda log başlatıldı.\nKaydedilen Dosya: {full_path}")
@@ -1131,7 +1107,7 @@ class YerKontrolIstasyonu(QWidget):
         text += f"Mod: <b style='color:#cdd6f4;'>{mode}</b> | Dur: <b style='color:{arm_color}'>{arm}</b><br>"
         text += f"Hız: <b style='color:#89b4fa;'>{speed:.1f} m/s</b><br>"
         text += f"Yön: <b style='color:#fab387;'>{yaw:.1f}°</b> (Set: {yon_sp:.1f}°)<br>"
-        text += f"<span style='font-size:11px; color:#888888;'>Lat:{lat:.5f} Lon:{lon:.5f}</span></span>"
+        text += f"Lat: <b style='color:#cdd6f4;'>{lat:.6f}</b> | Lon: <b style='color:#cdd6f4;'>{lon:.6f}</b></span>"
         self.lbl_ida_nav.setText(text)
         
         self.hist_speed.append(speed)
@@ -1144,15 +1120,16 @@ class YerKontrolIstasyonu(QWidget):
         if self.is_logging and self.csv_filename:
             with open(self.csv_filename, mode="a", newline="") as file:
                 writer = csv.writer(file)
-                writer.writerow([datetime.now().strftime("%H:%M:%S"), lat, lon, speed, roll, pitch, yaw, wp_dist, yon_sp])
+                writer.writerow([datetime.now().strftime("%H:%M:%S"), lat, lon, speed, roll, pitch, yaw, yon_sp])
         
         if self.harita_arac_secim.currentText() == "İDA":
             self.pfd.update_attitude(roll, pitch)
 
         now = time.time()
         if now - self.last_map_js_ida >= 0.2:
-            self.map_view.page().runJavaScript(f"try {{ if(typeof updateIdaPosition !== 'undefined') updateIdaPosition({lat}, {lon}, {yaw}, {speed}, '{mode}'); }} catch(e) {{}}")
-            self.last_map_js_ida = now
+            if lat != 0.0 and lon != 0.0:  # Haritayı Null Adası'ndan (0,0) koruyan kalkan
+                self.map_view.page().runJavaScript(f"try {{ if(typeof updateIdaPosition !== 'undefined') updateIdaPosition({lat}, {lon}, {yaw}, {speed}, '{mode}'); }} catch(e) {{}}")
+                self.last_map_js_ida = now
 
     def iha_guncelle(self, lat, lon, speed, alt, roll, pitch, yaw, mode, arm, yon_sp, wp_dist):
         arm_color = "#a6e3a1" if arm == "ARM" else "#f38ba8"
@@ -1160,8 +1137,8 @@ class YerKontrolIstasyonu(QWidget):
         text += f"<span style='font-size:13px; color:#cdd6f4; line-height:1.4;'>"
         text += f"Mod: <b style='color:#cdd6f4;'>{mode}</b> | Dur: <b style='color:{arm_color}'>{arm}</b><br>"
         text += f"İrtifa: <b style='color:#89b4fa;'>{alt:.1f} m</b><br>"
-        text += f"Hız: <b style='color:#fab387;'>{speed:.1f} m/s</b> Yön: <b style='color:#fab387;'>{yaw:.1f}°</b><br>"
-        text += f"<span style='font-size:11px; color:#888888;'>Lat:{lat:.5f} Lon:{lon:.5f}</span></span>"
+        text += f"Hız: <b style='color:#fab387;'>{speed:.1f} m/s</b> | Yön: <b style='color:#fab387;'>{yaw:.1f}°</b><br>"
+        text += f"Lat: <b style='color:#cdd6f4;'>{lat:.6f}</b> | Lon: <b style='color:#cdd6f4;'>{lon:.6f}</b></span>"
         self.lbl_iha_nav.setText(text)
         
         if self.harita_arac_secim.currentText() == "İHA":
@@ -1169,8 +1146,9 @@ class YerKontrolIstasyonu(QWidget):
 
         now = time.time()
         if now - self.last_map_js_iha >= 0.2:
-            self.map_view.page().runJavaScript(f"try {{ if(typeof updateIhaPosition !== 'undefined') updateIhaPosition({lat}, {lon}, {yaw}, {alt}, '{mode}'); }} catch(e) {{}}")
-            self.last_map_js_iha = now
+            if lat != 0.0 and lon != 0.0:  # Haritayı Null Adası'ndan (0,0) koruyan kalkan
+                self.map_view.page().runJavaScript(f"try {{ if(typeof updateIhaPosition !== 'undefined') updateIhaPosition({lat}, {lon}, {yaw}, {alt}, '{mode}'); }} catch(e) {{}}")
+                self.last_map_js_iha = now
 
     def log_yazdir(self, msg):
         self.logText.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -1188,4 +1166,3 @@ if __name__ == "__main__":
     window = YerKontrolIstasyonu()
     window.show()
     sys.exit(app.exec_())
-

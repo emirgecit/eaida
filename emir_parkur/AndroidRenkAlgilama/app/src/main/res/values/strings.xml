@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">İHA Gözcü</string>
+
+    <string name="searching">ARANIYOR</string>
+    <string name="no_box">kutu yok</string>
+
+    <string name="panel_fps">%.1f FPS</string>
+    <string name="panel_latency">%.1f ms</string>
+    <string name="frame_size">Kare: %1$d x %2$d</string>
+
+    <string name="python_starting">Python başlatılıyor…</string>
+    <string name="camera_permission_denied">Kamera izni reddedildi. Ayarlardan izin verin.</string>
+    <string name="camera_error">Kamera hatası: %1$s</string>
+</resources>
